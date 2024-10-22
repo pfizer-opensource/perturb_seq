@@ -1,0 +1,14 @@
+models/
+logs/
+outputs/
+pickles/
+**/__pycache__ 
+data/
+save/
+save_other/
+gears_trained_**/
+archive/
+gears_models/
+save_archive/
+figures/
+lamin**.py
