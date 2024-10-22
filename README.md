@@ -12,10 +12,16 @@ and GEARS 0.1.2 https://github.com/snap-stanford/GEARS
 We provide a .yml file called loot_methods.yml and an install script that will create a conda environment called perturb_seq with all the necesssary packages
 
 ## Scripts 
-runner.py: runner script for training, evaluating, and analyzing results
-analysis.py: script for generating figures and doing one-off analyses of files generated from runner.py
-library.py: contains core function definitions
-gears_runner.py: script for training GEARS models
 eval.sh: example SLURM script for running jobs 
+
 parallel_eval.sh: parallel way of running SLURM jobs
+
+runner.py: runner script for training, evaluating, and analyzing results
+
+analysis.py: script for generating figures and doing one-off analyses of files generated from runner.py
+
+library.py: contains core function definitions
+
+gears_runner.py: script for training GEARS models
+
 simple_affine.py: contains class definition for the Simple Affine model 
