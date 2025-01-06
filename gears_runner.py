@@ -7,15 +7,18 @@ from scgpt.utils import compute_perturbation_metrics
 
 def run_gears(runs=1, mode="train"):
     for run_number in range(0, runs):
-        for data_name in ["adamson", "norman", "replogle_k562_essential"]:
-        # for data_name in ["replogle_k562_gwps"]:
+        for data_name in ["adam_corrected", "adam_corrected_upr", "adamson", "norman", "replogle_k562_essential"]:
             ##setup PertData object
+            if data_name == "adam_corrected":
+                pert_data = get_adam_corrected_dataset(split="simulation", batch_size=64, test_batch_size=64, generate_new=False, just_upr=False)
+            if data_name == "adam_corrected_upr":
+                pert_data = get_adam_corrected_dataset(split="simulation", batch_size=64, test_batch_size=64, generate_new=False, just_upr=True)
             if data_name == "replogle_k562_gwps":
                 pert_data = get_replogle_gwps_pert_data(split='simulation', batch_size=64, test_batch_size=64, generate_new=False)
-            if data_name in ["adamson", "norman", "replogle_k562_essential", "dixit"]: 
+            if data_name in ["adamson", "norman", "replogle_k562_essential"]: 
                 # get data
                 pert_data = PertData('./data')
-                # load dataset in paper: norman, adamson, dixit.
+                # load dataset in paper: norman, adamson, replogle
                 pert_data.load(data_name = data_name)
                 # specify data split
                 pert_data.prepare_split(split = 'simulation', seed = 1)
@@ -58,6 +61,7 @@ def get_gears_rank(eval_results):
     ranks = compute_rank(pert_map)
     return ranks
 
+print("running gears")
 ##mode = "train" for training or "eval" for just evaluating models
-run_gears(runs=10, mode="eval")
+run_gears(runs=10, mode="train")
 

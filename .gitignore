@@ -8,7 +8,9 @@ save/
 save_other/
 gears_trained_**/
 archive/
+archive.py
 gears_models/
 save_archive/
 figures/
 lamin**.py
+scratch.py

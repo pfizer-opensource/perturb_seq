@@ -26,18 +26,13 @@ def main():
     parser.add_argument("--validation_selection", type=str, default="pearson", help="how to select the best model during training, if 'pearson' will be by pearson correlation between predicted and actual expression over validation set, if 'loss' will be by minimal loss")
     parser.add_argument("--loss_type", type=str, default="mse", help="mse, mse+triplet, mse+pearson")
     parser.add_argument("--fixed_seed", type=bool_flag, default=True, help="True if we want to use a constant fixed seed")
-    parser.add_argument("--optimal_pairings", type=str, default="None", help=" if we want to rearrange the training data loader to be control/perturbed matched instead of the default fixed random pairing, then set as either 'distance' or 'optimal_transport' else set as 'None'")
-    parser.add_argument("--optimal_distance_metric", type=str, default="None", help="if using optimal_pairings, will determine what metric to use for distance: 'sqeuclidean', 'cosine', 'correlation'")
-    parser.add_argument("--optimal_use_all_destination", type=bool, default=True, help="if using optimal_pairings, True will make sure all destination points are part of a pairing in the training / val set")
-    parser.add_argument("--optimal_space", type=str, default="raw", help="if using optimal_pairings, space to perform distance measures, 'raw', 'pca', or 'umap' space")
-
     opt = parser.parse_args()
     check_args(opt)
     matplotlib.rcParams["savefig.transparent"] = False
     if opt.fixed_seed: 
         set_seed(42)
     else:
-        set_seed(int(time.perf_counter())) ##introduce weight initialization variability across runs
+        set_seed(int(time.perf_counter()))
 
     ##var values will depend on load_model and mode 
     var = get_variables(load_model=opt.load_model, config_path=opt.config_path)
@@ -58,8 +53,14 @@ def main():
     logger.info(f"var: {var}")
 
     ##setup PertData object
+    if opt.data_name == "telohaec":
+        pert_data = get_telohaec_pert_data(split=var["split"], batch_size=var["batch_size"], test_batch_size=var["eval_batch_size"], generate_new=False)
     if opt.data_name == "replogle_k562_gwps":
         pert_data = get_replogle_gwps_pert_data(split=var["split"], batch_size=var["batch_size"], test_batch_size=var["eval_batch_size"], generate_new=False)
+    if opt.data_name == "adam_corrected":
+        pert_data = get_adam_corrected_dataset(split=var["split"], batch_size=var["batch_size"], test_batch_size=var["eval_batch_size"], generate_new=False, just_upr=False)
+    if opt.data_name == "adam_corrected_upr":
+        pert_data = get_adam_corrected_dataset(split=var["split"], batch_size=var["batch_size"], test_batch_size=var["eval_batch_size"], generate_new=False, just_upr=True)
     if opt.data_name in ["adamson", "norman", "replogle_k562_essential"]: 
         pert_data = PertData("./data")
         pert_data.load(data_name=opt.data_name) ##seems to instantiate a lot of PertData attributes
@@ -69,10 +70,6 @@ def main():
         logger.info("WARNING: filtering dataloaders! but keeping pert_data.adata the same")
         modify_pertdata_dataloaders(pert_data, logger)
 
-    if opt.optimal_pairings != 'None':
-        load_types = ["val", "train"]
-        print(f"reconfiguring {load_types} loader(s) with optimal pairings")
-        make_optimal_loaders(pert_data, optimal_pairings=opt.optimal_pairings, load_types=load_types, metric=opt.optimal_distance_metric, plot=False, use_all_destination=opt.optimal_use_all_destination, optimal_space=opt.optimal_space) ##just change the train/val loader for sake of fair evaluation 
     check_pert_split(opt.data_name, pert_data)
 
     logger.info(f"adata.obs: {pert_data.adata.obs}")
@@ -104,17 +101,23 @@ def main():
             pickle.dump(ranks, open(save_dir / f"rank_metrics_{opt.data_name}_{perturbench_model}.pkl", "wb"))
     
     ##mean predictor models - compute after data loaders are set (after a possible application of filter_perturbations)
-    if opt.mode in ["train", "test"]:
-        for baseline in ["baseline", "smart"]:
-            for mean_type in ["control+perturbed", "control", "perturbed"]:
+    if opt.mode in ["train", "test", "analysis"]:
+        for baseline in ["smart", "baseline"]:
+            for mean_type in ["perturbed", "control", "control+perturbed"]:
                 ##baseline mean 
                 if baseline == "baseline":
                     mean_pred_model = MeanPredictor(pert_data, opt.data_name, mean_type=mean_type)
+                    rank_save = f"pickles/rank_metrics_{opt.data_name}_mean_{mean_type}.pkl"
                 if baseline == "smart":
                     mean_pred_model = SmartMeanPredictor(pert_data, opt.data_name, mean_type=mean_type, crispr_type="crispra" if opt.data_name in ["norman"] else "crispri")
+                    rank_save = f"pickles/rank_metrics_{opt.data_name}_smart_mean_{mean_type}.pkl"
                 # mean_pred_model.test_ordering(pert_data.dataloader["test_loader"])
-                mean_res = eval_perturb(pert_data.dataloader["test_loader"], mean_pred_model, gene_ids=[], gene_idx_map={}, var={"device":"cpu"}, loss_type=opt.loss_type) ##keep on cpu, no need to shuttle to gpu for mean pred model 
+                ##get rank metrics 
+                test_perts = pickle.load(open(f"pickles/{opt.data_name}_perturbation_splits.pkl", "rb"))["test"]   
+                ranks = get_rank(mean_pred_model, test_perts, pert_data=pert_data, var=var, gene_ids=gene_ids, gene_idx_map=gene_idx_map)
+                pickle.dump(ranks, open(rank_save, "wb"))
                 ##GEARS-type metrics
+                mean_res = eval_perturb(pert_data.dataloader["test_loader"], mean_pred_model, gene_ids=[], gene_idx_map={}, var={"device":"cpu"}, loss_type=opt.loss_type) ##keep on cpu, no need to shuttle to gpu for mean pred model 
                 mean_metrics, mean_metrics_pert  = compute_metrics(mean_res) ##from GEARS library
                 logger.info(f"test metrics: ")
                 pickle.dump((mean_metrics, mean_metrics_pert), open(save_dir / f"{baseline}_mean_{mean_type}_results_{opt.data_name}.pkl", "wb"))
@@ -244,16 +247,17 @@ def main():
 
     if opt.mode == "analysis":    
         for plot_type in ["boxplots", "scatterplots"]:
-            if not os.path.isdir(f"figures/{plot_type}/{opt.data_name}/{opt.model_type}"):
-                os.makedirs(f"figures/{plot_type}/{opt.data_name}/{opt.model_type}")
-        test_perts = pickle.load(open(f"pickles/{opt.data_name}_perturbation_splits.pkl", "rb"))["test"]       
-        
-        ##get rank metrics 
+            if not os.path.isdir(f"figures/{plot_type}/{opt.data_name}/{opt.model_type}/{opt.load_model.replace('/', '_')}/"):
+                os.makedirs(f"figures/{plot_type}/{opt.data_name}/{opt.model_type}/{opt.load_model.replace('/', '_')}/")
+        test_perts = pickle.load(open(f"pickles/{opt.data_name}_perturbation_splits.pkl", "rb"))["test"]   
+        print("test perts: ", test_perts)
+
+        # ##get rank metrics 
         ranks = get_rank(best_model, test_perts, pert_data=pert_data, var=var, gene_ids=gene_ids, gene_idx_map=gene_idx_map)
         pickle.dump(ranks, open(f"pickles/rank_metrics_{opt.data_name}_{opt.model_type}.pkl", "wb"))
        
         ##make boxplots
-        pert_to_gene_iqr = plot_perturbation_boxplots(best_model, test_perts, save_directory=f"figures/boxplots/{opt.data_name}/{opt.model_type}/", pert_data=pert_data, var=var, gene_ids=gene_ids, gene_idx_map=gene_idx_map, data_name=opt.data_name, model_type=opt.model_type)
+        pert_to_gene_iqr = plot_perturbation_boxplots(best_model, test_perts, save_directory=f"figures/boxplots/{opt.data_name}/{opt.model_type}/{opt.load_model.replace('/', '_')}/", pert_data=pert_data, var=var, gene_ids=gene_ids, gene_idx_map=gene_idx_map, data_name=opt.data_name, model_type=opt.model_type)
         for plot_differential in [True, False]:
             pearson_string = "pearson de" if plot_differential == False else "pearson de delta"
             print(f"{opt.data_name}/{opt.model_type} {pearson_string} mean/std: ", np.mean(list([x[0] for x in list(pert_to_gene_iqr[f"control_differential={plot_differential}"].values())])), np.std(list(x[0] for x in list(pert_to_gene_iqr[f"control_differential={plot_differential}"].values()))))
@@ -261,13 +265,10 @@ def main():
         if not os.path.isdir("pickles/pert_to_gene_iqr/"):
             os.makedirs("pickles/pert_to_gene_iqr/")
         pickle.dump(pert_to_gene_iqr, open(f"pickles/pert_to_gene_iqr/pert_to_gene_iqr_{opt.data_name}_{opt.model_type}.pkl", "wb"))
-
-        # ##make scatterplots
-        # for p in test_perts:
-        #     plot_perturbation_scatterplots(best_model, p, save_directory=f"figures/scatterplots/{opt.data_name}/{opt.model_type}/", pert_data=pert_data, var=var, gene_ids=gene_ids, gene_idx_map=gene_idx_map, model_type=opt.model_type)
-        #convenience data structure for Rob and Abby 
-        # perturbation_structure = get_complete_data_structure_for_perturbation(best_model, test_perts, pert_data=pert_data, var=var, gene_ids=gene_ids, gene_idx_map=gene_idx_map, data_name=opt.data_name, model_type=opt.model_type)
-        # pickle.dump(perturbation_structure, open(f"pickles/pert_data_structure_{opt.data_name}_{opt.model_type}_load_{opt.load_model.replace('/', '_')}.pkl", "wb"))
+    
+        ##convenience data structure
+        perturbation_structure = get_complete_data_structure_for_perturbation(best_model, test_perts, pert_data=pert_data, var=var, gene_ids=gene_ids, gene_idx_map=gene_idx_map, data_name=opt.data_name, model_type=opt.model_type)
+        pickle.dump(perturbation_structure, open(f"pickles/pert_data_structure_{opt.data_name}_{opt.model_type}_load_{opt.load_model.replace('/', '_')}.pkl", "wb"))
 
 if __name__ == "__main__":
     main()

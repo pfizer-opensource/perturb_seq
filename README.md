@@ -1,4 +1,4 @@
-# Simple controls exceed best deep learning predictions and reveal foundation model effectiveness for predicting genetic perturbations
+# Simple controls exceed best deep learning algorithms and reveal foundation model effectiveness for predicting genetic perturbations
 
 Daniel R. Wong, Abby Hill, Robert Moccia
 
@@ -9,7 +9,7 @@ Machine Learning and Computational Sciences, Pfizer Worldwide Research Developme
 ## Software Installation
 We build off scGPT version 0.2.1 https://github.com/bowang-lab/scGPT
 and GEARS 0.1.2 https://github.com/snap-stanford/GEARS 
-We provide a .yml file called loot_methods.yml and an install script that will create a conda environment called perturb_seq with all the necesssary packages
+We provide a .yml file called loot_methods.yml and an install script that will create a conda environment called perturb_seq with all the necesssary packages and model files
 
 ## Scripts 
 eval.sh: example SLURM script for running jobs 

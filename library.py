@@ -92,8 +92,24 @@ def train(model: nn.Module, train_loader: torch.utils.data.DataLoader, n_genes: 
                 ECS=var["ECS"],
             )
             output_values = output_dict["mlm_output"]
-            masked_positions = torch.ones_like(input_values, dtype=torch.bool)  # Use all
-            loss = loss_mse = criterion(output_values, target_values, masked_positions)
+
+            if "de" in loss_type: ##compute loss over just de genes, alternatively we can also do a weighted loss: alpha * (DE loss) + beta * (non DE loss) (food for thought, not implemented) 
+                de_idx = batch_data.de_idx ##indices of de genes in pertdata.adata, list of lists (if control) or array objects (if perturbed), shape: batch_size x num de genes(=20)
+                ctrl_indices = [i for i in range(0, len(batch_data.pert)) if batch_data.pert[i] == "ctrl"]
+                non_ctrl_indices = [i for i in range(0, len(batch_data.pert)) if batch_data.pert[i] != "ctrl"]
+                de_idx = np.array(batch_data.de_idx)
+                de_idx[ctrl_indices, :] = np.random.randint(low=0, high=n_genes, size=(1, len(de_idx[0])))  ##random integers from 0 -> n_genes
+                for j in range(0, len(de_idx)): ##de_idx is indices of original adata.var, but output and target are in the ordering specified by input_gene_ids, therefore (if input_gene_ids is not the same ordering as adata.var when subsampling gene, i.e. subsample=True) for each index in de_idx we need to see what its index is in input_gene_ids
+                    pop_list = list(range(0, len(input_gene_ids))) ##if index not found will pop from this list of unique values (to ensure no redundancies)
+                    ##list of indices in input_gene_ids where de_idx[j][k] is found
+                    de_idx[j] = [(input_gene_ids == de_idx[j][k]).nonzero(as_tuple=True)[0].item() if de_idx[j][k] in input_gene_ids else pop_list.pop() for k in range(0, len(de_idx[j]))] ##if de_gene index is not found input_gene_ids indices, then use a random index 
+                de_idx = torch.from_numpy(de_idx).to(var["device"])
+                output_values = output_values[:, de_idx] ##keep all rows, but subselect just the de genes
+                target_values = target_values[:, de_idx]
+                loss = loss_mse = F.mse_loss(output_values, target_values, reduction="sum")
+            else:
+                masked_positions = torch.ones_like(input_values, dtype=torch.bool)  # Use all
+                loss = loss_mse = criterion(output_values, target_values, masked_positions)
             epoch_mse_loss += loss.item()
             if loss_type == "mse+triplet":
                 tl = get_triplet_loss(src=mapped_input_gene_ids, input_values=input_values, input_pert_flags=input_pert_flags, target_values=target_values, perts=batch_data.pert, condition_map=condition_map, input_gene_ids=input_gene_ids, t_loss=t_loss, model=model, device=var["device"], amp=var["amp"], not_perturbed_id=var["not_perturbed_id"], sample_ctrl_loader=True) ##sample loader for training
@@ -164,7 +180,7 @@ class MeanPredictor():
             self.mean_expression = loaded
         self.tiled_mean_expression = torch.from_numpy(np.tile(self.mean_expression, (256, 1))) ##convenience / speed up: compute once and extract it in pred_perturb instead of tiling over and over for each batch
     
-    def get_mean_expression(self, loader, mean_type="control+perturbed"):
+    def get_mean_expression(self, loader, mean_type="perturbed"):
         for batch, batch_data in enumerate(loader):
             if batch == 0:
                 matrix = torch.empty((0, batch_data.y.shape[1]))
@@ -193,19 +209,24 @@ class MeanPredictor():
 
     def test_ordering(self, loader):
         """
-        make sure each sc expression in batch.t is present in original pert_data.adata.X expression, would indicate that column ordering of batch is in same ordering as pert_data.adata.X
+        make sure each sc expression in batch.t is present in original pert_data.adata.X expression, would indicate that column ordering of batch is in same ordering as pert_data.adata.X, also check if pert condition matches 
         """
         for itr, batch in enumerate(loader):
             batch.to("cpu")
             t = batch.y
-            for sc_expr in t: 
-                sc_expr = sc_expr.numpy()
+            perts = batch.pert
+            for i in range(0, len(t)):
+                sc_expr_i = t[i]
+                pert_i = perts[i]
+                sc_expr_i = sc_expr_i.numpy()
                 found = False
-                for array in self.pert_data.adata.X.A:
-                    if np.array_equal(array, sc_expr):
+                for j in range(0, len(self.pert_data.adata.X.A)):
+                    array_j = self.pert_data.adata.X.A[j]
+                    if np.array_equal(array_j, sc_expr_i) and pert_i == self.pert_data.adata.obs["condition"][j]:
                         found = True
                         break
                 assert(found == True)
+        print("ordering is good")
     def eval(self):
         return
     def to(self, device):
@@ -220,7 +241,7 @@ class SmartMeanPredictor(MeanPredictor):
         self.genes = pert_data.adata.var["gene_name"].tolist()
         if crispr_type == "crispri": ##for crispri: for cells perturbed by gene A, we expect gene A expression to have 0x the expression of gene A expression for cells NOT perturbed by gene A (for a good crispri)
             self.multiplier = 0.0 
-        else: ##for crispra, we don't know how much fold change to expect for upregulation - not as clear cut as crispri: keep mean expression 
+        else: ##for crispra, we don't know how much fold change to expect for upregulation - not as clear cut as crispri: choose 2x arbitrarily as baseline
             self.multiplier = 2.0 
 
     def pred_perturb(self, batch, gene_ids=None, gene_idx_map=None, var=None):
@@ -284,7 +305,7 @@ def eval_perturb(
             total_loss += batch_mse_loss
             if not isinstance(model, MeanPredictor): ##if baseline MeanPredictor don't compute these special losses
                 if loss_type == "mse+triplet":
-                    input_gene_ids, mapped_input_gene_ids, input_values, input_pert_flags, src_key_padding_mask, target_values = batch_data_to_tensors(batch_data=batch, var=var, n_genes=len(gene_ids), gene_ids=gene_ids, gene_idx_map=gene_idx_map, random_shuffle=False, always_keep_pert_gene=False, subsample=False)
+                    input_gene_ids, mapped_input_gene_ids, input_values, input_pert_flags, src_key_padding_mask, target_values = batch_data_to_tensors(batch_data=batch, var=var, n_genes=len(gene_ids), gene_ids=gene_ids, gene_idx_map=gene_idx_map, random_shuffle=False, always_keep_pert_gene=False, subsample=False) ##on eval, do NOT subsample, rather provide the whole sequence (all genes) as context for inference 
                     batch_triplet_loss = get_triplet_loss(src=mapped_input_gene_ids, input_values=input_values, input_pert_flags=input_pert_flags,target_values=target_values, perts=batch.pert, condition_map=condition_map, input_gene_ids=input_gene_ids, t_loss=t_loss, model=model, device=var["device"], amp=var["amp"], sample_ctrl_loader=False).item() ##validation and test loaders do NOT have ctrl pert, so set sample_ctrl_loader=False
                     total_triplet_loss += batch_triplet_loss
                     total_loss += batch_triplet_loss
@@ -512,7 +533,7 @@ def modify_pertdata_dataloaders(pert_data, logger=None):
         skipped = set()
         old_loader = old_dataloaders[f"{load_type}_loader"]
         for batch, batch_data in enumerate(old_loader): ##batch_data is of type torch_geometric.data.batch.DataBatch, batch_data[i] is of type torch_geometric.data.data.Data
-            for i in range(0, len(batch_data)):
+            for i in range(0, len(batch_data)):                
                 if batch_data.pert[i] == "ctrl": ##always keep the ctrl condition
                     new_data.append(batch_data[i])
                 else:
@@ -537,11 +558,6 @@ def modify_pertdata_dataloaders(pert_data, logger=None):
 def check_args(opt):
     if opt.pretrain_control == True and opt.mode == "test":
         raise Exception("opt.pretrain_control == True and opt.mode == test")
-
-def check_dictionary_match(d1, d2, logger):
-    for key in d1:
-        if key in d2 and d1[key] != d2[key]:
-            logger.info(f"WARNING: mismatch key, value for key: {key}, values: {d1[key]}, {d2[key]}")
 
 def convert_ENSG_to_gene(ensg_list):
     """
@@ -705,7 +721,7 @@ def batch_data_to_tensors(batch_data=None, var=None, n_genes=None, gene_ids=None
     ori_gene_values = x[:, 0].view(batch_size, n_genes)
     pert_flags = get_pert_flags(batch_data, var["device"], batch_size, n_genes, gene_idx_map, random_shuffle, pert_pad_id=var["pert_pad_id"], not_perturbed_id=var["not_perturbed_id"], is_perturbed_id=var["is_perturbed_id"])
     target_gene_values = batch_data.y  # (batch_size, n_genes)
-    if var["include_zero_gene"] == "all":
+    if var["include_zero_gene"] == "all": ##default
         input_gene_ids = torch.arange(n_genes, device=var["device"], dtype=torch.long)
     else:
         input_gene_ids = (ori_gene_values.nonzero()[:, 1].flatten().unique().sort()[0])
@@ -764,7 +780,7 @@ def update_loss_map(loss_map, train_loss, val_res):
     
 def check_pert_split(data_name, pert_data):
     """
-    test to see if perturbation split among train, val, test are constant
+    test to see if perturbation split among train, val, test are constant, and also non-overlapping
     """
     splits = ["train", "val", "test"]
     split_to_perts = {split: set() for split in splits}
@@ -780,10 +796,22 @@ def check_pert_split(data_name, pert_data):
             assert(existing_map[split] == split_to_perts[split])
     else: ##if doesn't exist, make it 
         pickle.dump(split_to_perts, open(f"pickles/{data_name}_perturbation_splits.pkl", "wb"))
+    print("splits: ", split_to_perts)
+    
+    # ensure train val test perts are non-overlapping; formatting is inconsistent (e.g. ctrl+A and A+ctrl can both be present), therefore need to reformat to sorted strings for overlap checking
+    split_map = {split: set() for split in splits}
+    for split in splits:
+        for pert in split_to_perts[split]:
+            items = pert.split("+")
+            sorted_items = sorted(items)
+            sorted_string = ",".join(sorted_items)
+            split_map[split].add(sorted_string)
+    assert(len(split_map["train"].intersection(split_map["test"])) == 0)
+    assert(len(split_map["val"].intersection(split_map["test"])) == 0)
 
 def perturb_predict(model: TransformerGenerator, pert_list: List[str], pool_size: Optional[int] = None, pert_data: PertData = None, var: dict = None, gene_ids: list = None, gene_idx_map: dict = None, average: bool = True) -> Dict:
     """
-    Predict the gene expression values for the given perturbations. Helper function for plot_perturbation
+    Predict the gene expression values for the given perturbations. Helper function.
     Args:
         model (:class:`torch.nn.Module`): The model to use for prediction.
         pert_list (:obj:`List[str]`): The list of perturbations to predict.
@@ -849,51 +877,68 @@ def get_complete_data_structure_for_perturbation(model: nn.Module, pert_list: li
 
 def get_truth_and_preds(pert_data, query, model, var, gene_ids, gene_idx_map):
     """
-    Helper function for different plots, 
-    returns all_genes, all_truth, all_ctrl_means; de_idx, de_genes, de_truth, de_ctrl_means; pred; pert_string
+    for given query condition, returns all_genes, all_truth, all_ctrl_means; de_idx, de_genes, de_truth, de_ctrl_means; pred; pert_string
     """
-    ##output: all_genes, all_truth, all_ctrl_means,    de_idx, de_genes, de_truth, de_ctrl_means,     pred, pert_string
+    model.eval()
     adata = pert_data.adata
     gene2idx = pert_data.node_map ##key: normal gene name, value: index 
     cond2name = dict(adata.obs[["condition", "condition_name"]].values) ##key: condition, value: condition_name
     gene_raw2id = dict(zip(adata.var.index.values, adata.var.gene_name.values)) ##key: ENSG gene name, value: normal gene name
-    de_idx = [gene2idx[gene_raw2id[i]] for i in adata.uns["top_non_dropout_de_20"][cond2name[query]]] ##adata.uns["top_non_dropout_de_20"][cond2name[query]] is a list of ENSG genes
-    
-    all_genes = [gene_raw2id[i] for i in adata.var.index.values] ##alternatively just take adata.var.gene_name.values, seems redundant...
-    all_truth = adata[adata.obs.condition == query].X.toarray()
-    all_ctrl_means = adata[adata.obs["condition"] == "ctrl"].to_df().mean().values
-
+    de_idx = np.array([gene2idx[gene_raw2id[i]] for i in adata.uns["top_non_dropout_de_20"][cond2name[query]]]) ##adata.uns["top_non_dropout_de_20"][cond2name[query]] is a list of ENSG genes    
+    all_genes = [gene_raw2id[i] for i in pert_data.adata.var.index.values]
     de_genes = [gene_raw2id[i] for i in adata.uns["top_non_dropout_de_20"][cond2name[query]]] ##or: de_genes = np.array(all_genes)[de_idx]
-    de_truth = all_truth[:, de_idx]
-    de_ctrl_means = adata[adata.obs["condition"] == "ctrl"].to_df().mean()[de_idx].values
-    
+    n_genes = len(all_genes)
+    for batch, batch_data in enumerate(pert_data.dataloader["test_loader"]):
+        with torch.no_grad():
+            batch_data.to(var["device"])  
+            if batch == 0:
+                all_truth = np.empty((0, batch_data.y.shape[1]))
+                all_pred = np.empty((0, batch_data.y.shape[1]))
+                all_ctrl = np.empty((0, batch_data.y.shape[1]))
+                de_truth = np.empty((0, len(de_idx)))
+                de_pred = np.empty((0, len(de_idx)))
+                de_ctrl = np.empty((0, len(de_idx)))
+            ##get original_input_values in shape batch size x n_genes (includes all conditions not just query)
+            original_input_values = batch_data.x[:, 0].view(len(batch_data.y), n_genes)
+            ##get batch_data.pert into condition format 
+            batch_data.pert = convert_pert_to_condition_format(batch_data.pert)
+            #filter batch_data to just the query indices before feeding to model, adjust batch_data.x and batch_data.pert
+            query_indices = [i for i in range(0, len(batch_data.pert)) if batch_data.pert[i] == query]
+            if len(query_indices) == 0:
+                continue 
+            query_input = original_input_values[query_indices]
+            query_target = batch_data.y[query_indices]
+            batch_data.x = query_input.view(len(query_indices) * n_genes, 1) ##downstream applications of batch_data.x expect to be of shape (batch_size * n_genes, 1)
+            batch_data.pert = [batch_data.pert[i] for i in query_indices]
+            ##run through the model to get predictions 
+            output_values = model.pred_perturb(batch_data, gene_ids=gene_ids, gene_idx_map=gene_idx_map, var=var)
+            output_values = output_values.detach().cpu().numpy()
+            query_input = query_input.detach().cpu().numpy()
+            query_target = query_target.detach().cpu().numpy()
+            all_truth = np.concatenate((all_truth, query_target), 0)
+            all_pred = np.concatenate((all_pred, output_values), 0)
+            all_ctrl = np.concatenate((all_ctrl, query_input), 0)
+            de_truth = np.concatenate((de_truth, query_target[:, de_idx]), 0)
+            de_pred = np.concatenate((de_pred, output_values[:, de_idx]), 0)
+            de_ctrl =  np.concatenate((de_ctrl, query_input[:, de_idx]), 0)
+    all_ctrl_means = np.mean(all_ctrl, axis=0)
+    de_ctrl_means = all_ctrl_means[de_idx]
     if "ctrl" in query: ##singleton perturbation 
         parsed = [x for x in query.split("+") if x != "ctrl"] ##list of perturbation strings without control
         assert(len(parsed) == 1)
-        wrapped_pert_list = [[x] for x in parsed] #wrapped_pert_list = [query.split("+")[0]] ##original implementatation from authors, but does not account for the case of ctrl being in index 1 instead of 0!
         pert_string = parsed[0]
     else: ##combination perturbation 
-        wrapped_pert_list = [query.split("+")]
         pert_string = "_".join(query.split("+"))
-
-    pool_size = sum([1 for i in range(0, len(adata.obs["condition"])) if adata.obs["condition"][i] == query]) ##number of cells = query condition in the dataset, use this as the pool_size, which will be the number of randomly sampled control cells (without replacement) for use in forward prediction
-    ##get predictions by sampling pool size # of control cells and running them through model 
-    ##key: perturbation, value: prediction array of shape (# cells perturbed by perturbation, all genes) if average = False, else shape (all genes,)
-    pred = perturb_predict(model, wrapped_pert_list, pool_size=pool_size, pert_data=pert_data, var=var, gene_ids=gene_ids, gene_idx_map=gene_idx_map, average=False) 
-    all_pred = pred[pert_string]
-    de_pred = pred[pert_string][:, de_idx]
-    
     return all_genes, all_truth, all_ctrl_means, all_pred, de_idx, de_genes, de_truth, de_ctrl_means, de_pred, pert_string
-
+        
 def get_rank(model: nn.Module, pert_list: list, pert_data: PertData = None, var: dict = None, gene_ids: list = None, gene_idx_map: dict = None) -> tuple:
     """
     Wrapper for a call to compute_rank, organizes input data structure for non-GEARS models
     returns dictionary with key: perturbation condition, value: rank 
     """
-    ##key: pert, value: rank
-    pert_map = {query: () for query in pert_list} 
+    pert_map = {query: () for query in pert_list} ##key: pert, value: rank
     for query in pert_list:
-        all_genes, all_truth, all_ctrl_means, all_pred, de_idx, de_genes, de_truth, de_ctrl_means, de_pred, pert_string = get_truth_and_preds(pert_data, query, model, var, gene_ids, gene_idx_map)
+        all_genes, all_truth, all_ctrl_means, all_pred, de_idx, de_genes, de_truth, de_ctrl_means, de_pred, pert_string = get_truth_and_preds(pert_data, query, model, var, gene_ids, gene_idx_map) 
         pert_map[query] = np.mean(all_truth, axis=0), np.mean(all_pred, axis=0)
     return compute_rank(pert_map)
    
@@ -918,6 +963,14 @@ def compute_rank(pert_map: dict = None) -> tuple:
         rank = my_index / float(length)
         ranks[query] = rank 
     return ranks 
+
+def get_dataset_title(string):
+    ""
+    m = {"adamson": "GEARS Adamson (Deprecated)", "norman": "Norman", "replogle_k562_essential": "Replogle K562 Essential", "replogle_k562_gwps": "Replogle K562 GWPS", "telohaec": "Telohaec", "adam_corrected": "Corrected Adamson", "adam_corrected_upr": "Corrected Adamson UPR"}
+    if string not in m: 
+        raise Exception(f"{string} not present in title map")
+    else:
+        return m[string]
 
 def plot_perturbation_boxplots(model: nn.Module, pert_list: list, save_directory: str = None, pert_data: PertData = None, var: dict = None, gene_ids: list = None, gene_idx_map: dict = None, data_name: str = None, model_type: str = None) -> tuple:
     """
@@ -991,19 +1044,21 @@ def plot_perturbation_boxplots(model: nn.Module, pert_list: list, save_directory
 
             box = ax.get_position()
             ax.set_position([box.x0, box.y0, box.width, box.height * 0.85])
-            ax.legend(loc='upper right', prop={"size":8.5}, bbox_to_anchor=(1, 1.37))
+            ax.legend(loc='upper right', prop={"size":8}, bbox_to_anchor=(1, 1.37))
             plt.gcf().subplots_adjust(top=.76)
 
             ticks = de_genes
-            plt.xticks(range(0, len(ticks) * 2, 2), ticks, rotation=90, fontsize=12)
+            plt.xticks(range(0, len(ticks) * 2, 2), ticks, rotation=90, fontsize=9)
+            plt.yticks(range(0, int(np.max(de_truth_plot)) + 1, 1), fontsize=9)
             plt.xlim(-2, len(ticks)*2)
             plt.tight_layout()
             if plot_control_differential: 
-                plt.title(f"{data_name.replace('_', ' ').title()}: {query}, Pearson DE Delta = {round(pearson_score, 3)}", fontsize=15)
-                plt.ylabel("Change in Gene Expression over Control", labelpad=10, fontsize=12)
+                plt.title(f"{get_dataset_title(data_name)}: {query}, Pearson DE Delta = {round(pearson_score, 3)}", fontsize=13)
+                plt.ylabel("Change in Gene Expression over Control", labelpad=10, fontsize=9)
             else:
-                plt.title(f"{data_name.replace('_', ' ').title()}: {query}, Pearson DE = {round(pearson_score, 3)}", fontsize=15)
-                plt.ylabel("Gene Expression", labelpad=10, fontsize=12)
+                plt.title(f"{get_dataset_title(data_name)}: {query}, Pearson DE = {round(pearson_score, 3)}", fontsize=13)
+                plt.ylabel("Gene Expression", labelpad=10, fontsize=9)
+            print(f"target / pearson score: {query} / {pearson_score}")
             if plot_control_differential: ##plot zero line
                 plt.axhline(0, linestyle="dashed", color="grey")
             fig.savefig(os.path.join(save_directory, f"{model_type}_{query}_{plot_control_differential}.png"), bbox_inches="tight", transparent=False, dpi=300)
@@ -1078,152 +1133,6 @@ def plot_perturbation_scatterplots(model: nn.Module, query: str, save_directory:
         ax.legend(loc='lower left', prop={"size":6}, bbox_to_anchor=(1.0, 0)) ##if set lower right, will put legend inside plot
         plt.gcf().subplots_adjust(right=.76)
         fig.savefig(os.path.join(save_directory, f"{title.replace(' ', '_')}.png"), bbox_inches="tight", transparent=False)
-
-def get_optimal_pairings(a, b, optimal_pairings="optimal_transport", metric="sqeuclidean", plot=False, use_all_destination=False):
-    """
-    Given a matrix of source coordinates a, and another matrix of destination coordinates b (can be multi-dimensional),
-    return a list of optimal distance pairs (i,j) such that i is row index of a, j is row index of b
-    compute pairings either by: 
-    if optimal_pairings == "distance": simply pair source to target by shortest distance
-    if optimal_pairings == "optimal_transport": pair by solving the OT problem 
-    uses squared euclidean distance by default 
-    based off: https://pythonot.github.io/auto_examples/plot_OT_2D_samples.html 
-    """
-    import ot  
-    ##a is shape a x d, b is shape b x d
-    ##weights for each sample: make uniform 
-    a_weight = np.ones((len(a),)) / len(a) ##a x 1
-    b_weight = np.ones((len(b),)) / len(b) ##b x 1
-    C = ot.dist(a, b, metric=metric) ##default for ot.dist is sqeuclidean distance, a x b
-    if optimal_pairings == "distance": ##if want to make pairings based on shortest distance distance
-        col_indices = np.argmin(C, axis=1)
-    elif optimal_pairings == "optimal_transport": ##if want to make pairings based on solving the optimal transport problem
-        ot_emd = ot.emd(a_weight, b_weight, C) ##earth movers distance, will be of shape (a x b)
-        col_indices = np.argmax(ot_emd, axis=1)
-    else:
-        raise Exception("optimal_pairings must be one of distance or optimal_transport")
-    pairs = [(i, col_indices[i]) for i in range(0, len(C))]
-
-    if len(set(col_indices)) != len(b):
-        print(f"WARNING: pairings are not 1-1. Have {len(a)} source points, missing {len(b) - len(set(col_indices))} destination points out of {len(b)}")
-        if use_all_destination:
-            print("using all destination cells and adding to closest source cell")
-            unused_col_indices = [i for i in range(0, len(b)) if i not in col_indices]
-            for unused_index in unused_col_indices:
-                ##find closest perturbed cell (row with minimum value)
-                distances = C[:, unused_index] ##distance of target to each of the sources 
-                min_row = np.argmin(distances, axis=0) ##corresponds to which source has minimal distance to target 
-                pairs.append((min_row, unused_index)) ##add to pairs 
-    if plot: 
-        import ot.plot
-        import matplotlib.pyplot as plt  
-        fig, ax = plt.subplots()
-        ##subset n random a, get corresponding b
-        a_subset = np.array(random.sample(list(range(0, len(a))), 100))
-        b_subset = np.array(col_indices[a_subset])
-        a = a[a_subset]
-        b = b[b_subset]
-        if optimal_pairings == "distance":
-            C = C[a_subset, :]
-            C = C[:, b_subset]
-        if optimal_pairings == "optimal_transport":
-            ot_emd = ot_emd[a_subset, :]
-            ot_emd = ot_emd[:, b_subset]
-        if len(a[0]) > 2 and len(b[0]) > 2:
-            try: 
-                reducer = PCA(n_components=2)
-                reducer.fit(np.vstack((a, b)))
-                a = reducer.transform(a)
-                b = reducer.transform(b)
-                red_type = "PCA"
-            except:
-                reducer = umap.UMAP()
-                reducer.fit(np.vstack((a, b)))
-                a = reducer.transform(a)
-                b = reducer.transform(b)
-                red_type = "UMAP"
-        else:
-            red_type = "" ##if already in 2D space, then was reduced prior by either UMAP or PCA 
-        if optimal_pairings == "distance":
-            ot.plot.plot2D_samples_mat(a, b, C, c=[.5, .5, 1])
-        if optimal_pairings == "optimal_transport":
-            ot.plot.plot2D_samples_mat(a, b, ot_emd, c=[.5, .5, 1])
-        ax.plot(a[:, 0], a[:, 1], '+b', label='Source samples')
-        ax.plot(b[:, 0], b[:, 1], 'xr', label='Target samples')
-        ax.legend(loc=0)
-        plt.title(f'{red_type} OT matrix')
-        random_seed = random.randint(0, 1000000000)
-        plt.savefig(f"outputs/ot_{optimal_pairings}_{metric}_{random_seed}.png")
-    return pairs 
-
-def make_optimal_loaders(pert_data, optimal_pairings="None", load_types=["train"], metric=None, plot=False, use_all_destination=False, optimal_space="raw"):
-    """
-    Modifies pert_data object by changing the loaders specified by load_types to be optimally paired
-    optimal_pairings in ["distance", "optimal_transport"] 
-    """
-    for load_type in load_types: 
-        loader = pert_data.dataloader[f"{load_type}_loader"]
-        old_length = len(loader)
-        ##iterate over loader and make array for control cells, an array for perturbed cells, a list for keeping track of perturbation, and a map from perturbation to de gene indices 
-        de_idx_map = {} ##key: perturbation, value: de_idx; keep track of perturbation differentially expressed indices, cells with same perturbation will have same de_idx by definition because dependent on perturbation 
-        control_count = 0 ##number of control perturbations in this loader #for reference 24,263 in entire Adamson dataset (train/val/test)
-        for batch, batch_data in enumerate(loader):
-            control_indices = [i for i in range(0, len(batch_data.pert)) if batch_data.pert[i] == "ctrl"]
-            pert_indices = [i for i in range(0, len(batch_data.pert)) if batch_data.pert[i] != "ctrl"]
-            control_count += len(control_indices)
-            if load_type in ["val", "test"]: ##in test and val loader, there are not pert=="ctrl", so need to make control array by taking the inputs in .x
-                inputs = batch_data.x[:, 0].view(batch_data.y.shape[0], len(batch_data.y[0]))
-            if batch == 0: 
-                if load_type in ["val", "test"]:
-                    control_array = np.copy(inputs)
-                else:
-                    control_array = np.copy(batch_data.y[control_indices, :]) ##for pert==ctrl, y is the control expression 
-                perturbed_array = np.copy(batch_data.y[pert_indices, :])
-                perturbation_label = [batch_data.pert[i] for i in pert_indices] ##will keep track of the perturbation label for perturbed_array 
-                batch_size = batch_data.y.shape[0]
-            else:
-                if load_type in ["val", "test"]:
-                    control_array = np.concatenate((control_array, inputs), axis=0)
-                else:
-                    control_array = np.concatenate((control_array, batch_data.y[control_indices, :]), axis=0)
-                perturbed_array = np.concatenate((perturbed_array, batch_data.y[pert_indices, :]), axis=0)
-                perturbation_label += [batch_data.pert[i] for i in pert_indices]
-            for i in range(0, len(batch_data)): ##getting de_idx_map is trickier because batch_data.de_idx is a list of np arrays...
-                pert = batch_data.pert[i]
-                if pert not in de_idx_map:
-                    de_idx_map[pert] = batch_data.de_idx[i]
-                else:
-                    assert(np.array_equal(de_idx_map[pert], batch_data.de_idx[i]))
-        if "ctrl" in de_idx_map and isinstance(de_idx_map["ctrl"], list):
-            de_idx_map["ctrl"] = np.array(de_idx_map["ctrl"]) ##ctrl de_idx is list instead of numpy for some reason
-        ##create OT pairings between control and perturbed, have source be perturbed and control be destination to ensure that each perturbed cell has a mapping to a (possibly redundant) control cell  
-        if optimal_space == "raw":
-            pairings = get_optimal_pairings(perturbed_array, control_array, optimal_pairings=optimal_pairings, metric=metric, plot=plot, use_all_destination=use_all_destination)
-        elif optimal_space in ["pca", "umap"]:
-            reducer = PCA(n_components=50) if optimal_space == "pca" else umap.UMAP(n_components=50)
-            reducer.fit(np.vstack((perturbed_array, control_array)))
-            pairings = get_optimal_pairings(reducer.transform(perturbed_array), reducer.transform(control_array), optimal_pairings=optimal_pairings, metric=metric, plot=plot, use_all_destination=use_all_destination)
-        else:
-            raise Exception("optimal space must be one of raw, pca, or umap")
-        ##put pairings into new data pairs and make new dataloader 
-        new_data = []
-        if load_type == "train":
-            for i in range(0, control_count):  ##make control datapoints to add to new loader (same # as original loader)
-                ##reshaping x to be (g x 1) is necessary, as well as reshaping y to be (1 x g), de_idx is a list of tensors
-                entry = Data(x=torch.Tensor(control_array[i].reshape(len(control_array[i]), 1)), y=torch.Tensor(control_array[i].reshape(1, len(control_array[i]))), de_idx=torch.Tensor(de_idx_map["ctrl"].reshape(1, len(de_idx_map["ctrl"]))), pert="ctrl")
-                new_data.append(entry)
-        for source_c, dest_c in pairings: ##make control<->perturbed matched datapoints
-            control_cell = control_array[dest_c]
-            perturbed_cell = perturbed_array[source_c]
-            pert = perturbation_label[source_c]
-            entry = Data(x=torch.Tensor(control_cell.reshape(len(control_cell), 1)), y=torch.Tensor(perturbed_cell.reshape(1, len(perturbed_cell))), de_idx=torch.tensor(de_idx_map[pert].reshape(1, len(de_idx_map[pert]))), pert=pert)  
-            new_data.append(entry)
-        shuffle = True if load_type == "train" else False
-        from torch_geometric.data import DataLoader as tgdl 
-        new_loader = tgdl(new_data, batch_size=batch_size, shuffle=shuffle) # new_loader = DataLoader(new_data, batch_size=batch_size, shuffle=shuffle)
-        if use_all_destination == False:
-            assert(old_length == len(new_loader)) ##make sure new dataloader is same length as old one
-        pert_data.dataloader[f"{load_type}_loader"] = new_loader
 
 def convert_pert_flags_to_one_hot(pert_list, one_hot_map):
     """
@@ -1363,8 +1272,8 @@ class LatentAdditive(nn.Module):
         Keep method definition the same as scGPT for ease and reusability 
         """
         one_hot_matrix = convert_pert_flags_to_one_hot(batch.pert, self.one_hot_map)
-        input_values = batch.x
-        input_values = input_values[:, 0].view(len(batch.pert), len(gene_ids))
+        input_values = batch.x #(batch_size * n_genes, 1)
+        input_values = input_values[:, 0].view(len(batch.pert), len(gene_ids)) #(batch_size * n_genes)
         predicted_perturbed_expression = self.forward(input_values, one_hot_matrix)
         return predicted_perturbed_expression
 
@@ -1401,13 +1310,60 @@ class DecoderOnly(LatentAdditive):
             predicted_perturbed_expression = F.softplus(predicted_perturbed_expression)
         return predicted_perturbed_expression
 
+def get_adam_corrected_dataset(split, batch_size, test_batch_size, generate_new=False, just_upr=False):
+    if just_upr: 
+        dataset_name = "adam_corrected_upr"
+        data_path = './data/adam_corrected_upr'
+    else:
+        dataset_name = "adam_corrected"
+        data_path = './data/adam_corrected'
+    if generate_new: 
+        adata = sc.read_h5ad("/hpfs/projects/mlcs/mlhub/perturbseq/adamson_corrected/gears_adamson_updated_metadata.h5ad")
+        if just_upr: ##adamson actually consists of many independent datasets!
+            adata = adata[adata.obs["experiment"] == "upr"]
+        print("obs keys", adata.obs.keys())
+        print("var index", adata.var.index)
+        print("var gene name", adata.var["gene_name"])
+        print("adata X", adata.X[0][0:10])
+        print("condition_corrected", set(adata.obs["condition_corrected"]))
+        ##need to strip the _only (single target) and combine multitargets into format A+B+C
+        new_condition_corrected = []
+        for i in range(0, len(adata.obs["condition_corrected"])):
+            string = adata.obs["condition_corrected"][i]
+            if "_only" in string:
+                string = string.replace("_only", "")
+            if "_" in string: 
+                string = string.replace("_", "+")
+            new_condition_corrected.append(string)
+        adata.obs["condition_corrected"] = new_condition_corrected
+        print("condition_corrected", set(adata.obs["condition_corrected"]))
+        assert(True not in ["only" in x for x in new_condition_corrected])
+        print(len(adata))
+        adata = adata[adata.obs["condition_corrected"] != "ambiguous"] ##remove cells we can't determine a condition for
+        print(len(adata))
+        adata.obs["condition"] = convert_pert_to_condition_format(list(adata.obs["condition_corrected"]))
+        print("condition", adata.obs["condition"])
+        pert_data = PertData("./data")
+        init_time = time.time()
 
-
-
-
-
-        
-
-
-
-
+        pert_data.new_data_process(dataset_name=dataset_name, adata=adata)
+        print(f"time for new_data_process: {time.time() - init_time}")
+        init_time = time.time()
+        pert_data.load(data_path = data_path) # to load the processed data
+        print(f"time for load: {time.time() - init_time}")
+        init_time = time.time()
+        pert_data.prepare_split(split=split, seed=1)
+        print(f"time for prepare_split: {time.time() - init_time}")
+        init_time = time.time()
+        pert_data.get_dataloader(batch_size=batch_size, test_batch_size=test_batch_size)
+        print(f"time for get_dataloader: {time.time() - init_time}")
+        return pert_data
+    else:
+        if os.path.isfile(f"data/{dataset_name}/perturb_processed.h5ad"):
+            pert_data = PertData("./data")
+            pert_data.load(data_path = data_path)
+            pert_data.prepare_split(split=split, seed=1)
+            pert_data.get_dataloader(batch_size=batch_size, test_batch_size=test_batch_size)
+            return pert_data
+        else:
+            raise Exception("perturb_processed.h5ad does not exist! generate new")

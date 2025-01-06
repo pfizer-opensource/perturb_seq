@@ -1,6 +1,9 @@
 from scgpt.model.generation_model import *
 
 class SimpleAffine(nn.Module):
+    """
+    Equivalent model architecture to scGPT minus the transformer blocks
+    """
     def __init__(
         self,
         ntoken: int,

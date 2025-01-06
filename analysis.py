@@ -9,19 +9,37 @@ import venn
 from scgpt.utils import get_gene_names
 import re
 import itertools
+import glob
+import sklearn.metrics as sklm
+import seaborn as sns
 
-datasets = ["adamson", "norman", "replogle_k562_essential"]
 
-def get_dataset_title(string):
-    ""
-    m = {"adamson": "Adamson", "norman": "Norman", "replogle_k562_essential": "Replogle K562 Essential", "replogle_k562_gwps": "Replogle K562 GWPS"}
-    if string not in m: 
-        raise Exception(f"{string} not present in title map")
-    else:
-        return m[string]
+datasets = ["adam_corrected", "adam_corrected_upr", "adamson", "norman", "replogle_k562_essential"]
+# datasets = ["adam_corrected_upr",  "norman", "replogle_k562_essential"]
+
+def get_pert_data(data_name):
+    if data_name in ["adamson", "norman", "replogle_k562_essential"]: 
+        pert_data = PertData("./data")
+        pert_data.load(data_name=data_name)
+        pert_data.prepare_split(split="simulation", seed=1)
+        pert_data.get_dataloader(batch_size=64, test_batch_size=64)
+    if data_name == "adam_corrected":
+        pert_data = get_adam_corrected_dataset(split="simulation", batch_size=64, test_batch_size=64, generate_new=False, just_upr=False)
+    if data_name == "adam_corrected_upr":
+        pert_data = get_adam_corrected_dataset(split="simulation", batch_size=64, test_batch_size=64, generate_new=False, just_upr=True)
+    if data_name == "replogle_k562_gwps":
+        pert_data = get_replogle_gwps_pert_data(split="simulation", batch_size=64, test_batch_size=64, generate_new=False)
+    if "replogle" in data_name:
+        modify_pertdata_anndata(pert_data)
+        modify_pertdata_dataloaders(pert_data, logger=None)
+    return pert_data
 
 def get_dataset(string):
-    mapp = {"adamson": "adamson", "norman": "norman", "replogle":  "replogle_k562_essential", "combined": "combined"}
+    mapp = {"adamson": "adamson", "norman": "norman", "replogle":  "replogle_k562_essential", "combined": "combined", "telohaec": "telohaec", "adam_corrected": "adam_corrected", "adam_corrected_upr": "adam_corrected_upr"}
+    if  "adam_corrected_upr" in string: #adam_corrected is a substring of adam_corrected_upr, deal with this case first 
+        return "adam_corrected_upr"
+    if "adam_corrected" in string:
+        return "adam_corrected"
     for key_phrase in mapp:
         if key_phrase in string:
             return mapp[key_phrase]
@@ -29,8 +47,8 @@ def get_dataset(string):
 def get_avg_baseline(mode):
     ##key: method, key: dataset, key: score metric, value: list of scores
     baseline_map = {"scGPT": {}, "gears": {}, "mean_control": {},
-    "mean_perturbed": {}, "mean_control+perturbed": {},
-    "smart_mean_control": {}, "smart_mean_perturbed": {}, "smart_mean_control+perturbed":{}}
+    "mean_perturbed": {},"smart_mean_control": {}, "smart_mean_perturbed": {}, 
+    "mean_control+perturbed": {}, "smart_mean_control+perturbed":{}}
     for method in baseline_map: 
         if method == "scGPT":
             baseline_root = "save/default_config_baseline/"
@@ -73,7 +91,7 @@ def get_avg_baseline(mode):
                 dataset = get_dataset(directory)
                 for mean_baseline in ["smart", "baseline"]:
                     prefix = "smart_" if mean_baseline == "smart" else ""
-                    for mean_type in ["control+perturbed", "control", "perturbed"]:
+                    for mean_type in ["perturbed", "control+perturbed", "control"]:
                         if mode == 1: 
                             mean_map = pickle.load(open(os.path.join(baseline_root, directory, f"{mean_baseline}_mean_{mean_type}_pert_delta_results_{dataset}.pkl"), "rb"))
                         else:
@@ -101,10 +119,13 @@ def get_no_pretraining_results(mode, x_labels):
                 paths.append(os.path.join(root, file))
             if mode == 2 and f"scGPT_results" in file:
                 paths.append(os.path.join(root, file))
+    adam_corrected_multirun_results = get_path_results("save/no_pretraining/adam_corrected_run_1/scGPT_pert_delta_results_adam_corrected.pkl", paths, x_labels, mode)
+    adam_corrected_upr_multirun_results = get_path_results("save/no_pretraining/adam_corrected_upr_run_1/scGPT_pert_delta_results_adam_corrected_upr.pkl", paths, x_labels, mode)
     adamson_multirun_results = get_path_results("save/no_pretraining/adamson_run_1/scGPT_pert_delta_results_adamson.pkl", paths, x_labels, mode)
     norman_multirun_results = get_path_results("save/no_pretraining/norman_run_1/scGPT_pert_delta_results_norman.pkl", paths, x_labels, mode)
     replogle_multirun_results = get_path_results("save/no_pretraining/replogle_k562_essential_run_1/scGPT_pert_delta_results_replogle_k562_essential.pkl", paths, x_labels, mode)
-    return {"adamson": adamson_multirun_results, "norman": norman_multirun_results, "replogle_k562_essential": replogle_multirun_results}
+    return_map = {"adam_corrected": adam_corrected_multirun_results, "adam_corrected_upr": adam_corrected_upr_multirun_results, "adamson": adamson_multirun_results, "norman": norman_multirun_results, "replogle_k562_essential": replogle_multirun_results}
+    return return_map
 
 def get_model_title_from_path(string):
     if "no_pretraining" in string:
@@ -136,6 +157,7 @@ def get_model_type(string, formal=False):
         return "CRISPR-informed Mean" if formal else "smart_mean"
     if "baseline_mean" in string:
         return "Training Mean" if formal else "baseline_mean"
+    raise Exception(f"model for {string} not found")
     
 def get_path_results(path, paths, x_labels, mode):
     """
@@ -146,12 +168,11 @@ def get_path_results(path, paths, x_labels, mode):
     """
     ##get y_model and (if part of a multi-run experiment) y_model_std 
     if "_run_" in path: ##if this file path is part of a multi-set run, then find the other files and aggregate them into avg and std scores
-        prefix = path[0: path.find("_run_")]
-        if "perturbench" in path:
-            suffix = path[path.find("_run_") + 7: ]
-            same_run_paths = [p for p in paths if prefix in p and suffix in p]
-        else:
-            same_run_paths = [p for p in paths if prefix in p]
+        run_number = re.findall(r"run_[0-9]+", path)[0]
+        stripped_path = path.replace(run_number, "")
+        same_run_paths = [p for p in paths if "run_" in p and p.replace(re.findall(r"run_[0-9]+", p)[0], "") == stripped_path]
+        if len(same_run_paths) != 10:
+            raise Exception(f"path: {path}, len(same_run_paths) != 10")
         for index, srp in enumerate(same_run_paths):
             if mode == 1: 
                 model_res = pickle.load(open(srp, "rb"))
@@ -204,8 +225,10 @@ def plot_model_scores(mode):
     ##find all paths to scGPT (or simple affine) result files within save, check if part of a multi-run 
     paths = [] 
     for root, dirs, files in os.walk("save/"):
+        if "archive" in root:
+            continue
         for file in files:
-            if "baseline" in file: ##skip baseline file
+            if "baseline" in file or "smart_mean" in file or "result" not in file: ##skip baseline file or non-result files
                 continue 
             model_type = get_model_type(os.path.join(root, file))
             if model_type not in ["scgpt", "simple_affine"]:
@@ -214,10 +237,14 @@ def plot_model_scores(mode):
                 paths.append(os.path.join(root, file))
             if mode == 2 and f"_results" in file and "pert_delta" not in file:
                 paths.append(os.path.join(root, file))
+
     ##iterate over file paths and plot the results
     for path in paths: 
+        # try: 
         ##get dataset that results are for 
         dataset = get_dataset(path)
+        if dataset not in dataset_map.keys():
+            continue
         model_type = get_model_title_from_path(path)
         if dataset == "combined": 
             continue
@@ -274,49 +301,60 @@ def plot_model_scores(mode):
             plt.savefig(f"outputs/multirun_{prefix.replace('/', '_')}_mode={mode}.png", dpi=300)
         else:
             plt.savefig(f"outputs/{path.replace('/', '_')}_mode={mode}.png", dpi=300)
+        
+        # except Exception as e:
+            # print(f"Exception with path {path}: {e}")        
 
 def plot_subset_model_scores(mode, include_simple_affine=False):
     """
-    Plot bar graphs for just a subset of the results of interest
+    Plot bar graphs for just a subset of the results of interest, namely the different weight loading schemes
     """
     dataset_map = get_baseline_dataset_map(mode)
-    paths = []
     if include_simple_affine:
         root_dirs = ["save/no_pretraining", "save/transformer_encoder_control", "save/input_encoder_control", "save/simple_affine"]
+        permitted_models = ["scgpt", "simple_affine"]
     else:
         root_dirs = ["save/no_pretraining", "save/transformer_encoder_control", "save/input_encoder_control"]
+        permitted_models = ["scgpt"]
+    paths = []
     for root_dir in root_dirs: 
         for root, dirs, files in os.walk(root_dir):
             for file in files:
-                model_type = get_model_type(os.path.join(root, file))
-                if model_type not in ["scgpt", "simple_affine"]:
+                if "results" not in file:
+                    continue
+                # model_type = get_model_type(os.path.join(root, file))
+                model_type = get_model_type(file)
+                if model_type not in permitted_models:
                     continue 
                 if mode == 1 and "pert_delta_results" in file:
                     paths.append(os.path.join(root, file))
                 if mode == 2 and "_results" in file and "pert_delta" not in file:
                     paths.append(os.path.join(root, file))
-    scgpt_perm_map = {perm: {dataset: "" for dataset in datasets} for perm in root_dirs} ##key scgpt permutation as directory path, key: dataset, value: (y_model, y_std)
+    perm_map = {perm: {dataset: "" for dataset in datasets} for perm in root_dirs} ##key: permutation as directory path, key: dataset, value: (y_model, y_std)
     baseline_map = {dataset: "" for dataset in datasets} #key dataset: value: baseline_y_std_map (key: model, value: tuple(scores list, std list) corresponding to x_labels)
-    ##iterate over file paths and fill out scgpt_perm_map
+    ##iterate over file paths and fill out perm_map
     for path in paths: 
         ##get dataset that results are for 
         dataset = get_dataset(path)
+        if dataset not in dataset_map.keys():
+            continue
         ##get baseline data to plot
         x_labels = list(dataset_map[dataset]["gears"].keys())
         baseline_y_std_map = get_baseline_y_std_map(dataset_map, dataset, x_labels)
         baseline_map[dataset] = baseline_y_std_map
         ##get results for this path to plot
         y_model, y_model_std = get_path_results(path, paths, x_labels, mode)
-        for key in scgpt_perm_map:
+
+        for key in perm_map:
             if key in path: 
                 assigned_key = key
                 break
-        if scgpt_perm_map[assigned_key][dataset] != "":
-            assert(scgpt_perm_map[assigned_key][dataset] == (y_model, y_model_std)) ##this should be the same for paths of the same multi-run
+        if perm_map[assigned_key][dataset] != "":
+            assert(perm_map[assigned_key][dataset] == (y_model, y_model_std)) ##this should be the same for paths of the same multi-run
         else:
-            scgpt_perm_map[assigned_key][dataset] = (y_model, y_model_std)
+            perm_map[assigned_key][dataset] = (y_model, y_model_std)
     ##print model to model comparisons 
-    compare_models_across_datasets(scgpt_perm_map, baseline_map, x_labels)
+    compare_models_across_datasets(perm_map, baseline_map, x_labels)
     ##plot 
     for dataset in baseline_map.keys():
         fig, ax = plt.subplots()
@@ -327,12 +365,12 @@ def plot_subset_model_scores(mode, include_simple_affine=False):
                 "Mean": (baseline_map[dataset]["mean_perturbed"][0], baseline_map[dataset]["mean_perturbed"][1], "salmon"),
                 "CRISPR-informed Mean": (baseline_map[dataset]["smart_mean_perturbed"][0], baseline_map[dataset]["smart_mean_perturbed"][1] , "goldenrod"),
                 "scGPT Fully Fine-Tuned Baseline": (baseline_map[dataset]["scGPT"][0], baseline_map[dataset]["scGPT"][1], "#519E3E"),
-                "scGPT (no pre-training)": (scgpt_perm_map["save/no_pretraining"][dataset][0], scgpt_perm_map["save/no_pretraining"][dataset][1], "mediumpurple"),
-                "scGPT (randomly initialized input encoder) ": (scgpt_perm_map["save/input_encoder_control"][dataset][0], scgpt_perm_map["save/input_encoder_control"][dataset][1], "purple"),
-                "scGPT (randomly initialized transformer encoder) ": (scgpt_perm_map["save/transformer_encoder_control"][dataset][0], scgpt_perm_map["save/transformer_encoder_control"][dataset][1], "darkviolet")
+                "scGPT (no pre-training)": (perm_map["save/no_pretraining"][dataset][0], perm_map["save/no_pretraining"][dataset][1], "mediumpurple"),
+                "scGPT (randomly initialized input encoder) ": (perm_map["save/input_encoder_control"][dataset][0], perm_map["save/input_encoder_control"][dataset][1], "purple"),
+                "scGPT (randomly initialized transformer encoder) ": (perm_map["save/transformer_encoder_control"][dataset][0], perm_map["save/transformer_encoder_control"][dataset][1], "darkviolet")
                 }
         if include_simple_affine:
-            y_dict.update({"Simple Affine": (scgpt_perm_map["save/simple_affine"][dataset][0], scgpt_perm_map["save/simple_affine"][dataset][1], "grey") })
+            y_dict.update({"Simple Affine": (perm_map["save/simple_affine"][dataset][0], perm_map["save/simple_affine"][dataset][1], "grey") })
         ##make the plot and annotate it
         width = 0.12
         for method in y_dict:
@@ -353,13 +391,14 @@ def plot_subset_model_scores(mode, include_simple_affine=False):
         plt.gcf().subplots_adjust(top=.76)
         plt.savefig(f"outputs/aggregated_results_{dataset}_mode={mode}.png", dpi=300)
 
-def compare_models_across_datasets(scgpt_perm_map, baseline_map, x_labels):
+def compare_models_across_datasets(perm_map, baseline_map, x_labels):
     """
     Helper method for plot_subset_model_scores, will do pairwise model performance comparisons and print the pairwise differences of averages
     """
+    print(f"datasets used to calculate MAD scores: {baseline_map.keys()}")
     model_pairs_map = {} ##key: (model1, model2) always sorted tuple, key: metric, value: list of (model1 avg - model2 avg)
     for dataset in baseline_map:
-        model_pairs = itertools.combinations(set(list(baseline_map[dataset].keys()) + list(scgpt_perm_map.keys())), 2)
+        model_pairs = itertools.combinations(set(list(baseline_map[dataset].keys()) + list(perm_map.keys())), 2)
         model_pairs = [sorted(x) for x in model_pairs]
         for i in range(0, len(x_labels)):
             x_label = x_labels[i]
@@ -368,14 +407,14 @@ def compare_models_across_datasets(scgpt_perm_map, baseline_map, x_labels):
                     model_pairs_map[(m1, m2)] = {x_l: [] for x_l in x_labels}
                 if m1 in baseline_map[dataset].keys():
                     score1 = baseline_map[dataset][m1][0][i]
-                if m1 in scgpt_perm_map.keys():
-                    score1 = scgpt_perm_map[m1][dataset][0][i]
+                if m1 in perm_map.keys():
+                    score1 = perm_map[m1][dataset][0][i]
                 if m2 in baseline_map[dataset].keys():
                     score2 =  baseline_map[dataset][m2][0][i]
-                if m2 in scgpt_perm_map.keys():
-                    score2 = scgpt_perm_map[m2][dataset][0][i]
+                if m2 in perm_map.keys():
+                    score2 = perm_map[m2][dataset][0][i]
                 # model_pairs_map[(m1, m2)][x_label].append(baseline_map[dataset][m1][0][i] - baseline_map[dataset][m2][0][i])
-                model_pairs_map[(m1, m2)][x_label].append(score1 - score2)
+                model_pairs_map[(m1, m2)][x_label].append(abs(score1 - score2))
     ##drop pearson and pearson de
     for key in model_pairs_map:
         model_pairs_map[key] = {key2: model_pairs_map[key][key2] for key2 in model_pairs_map[key].keys() if key2 not in ["pearson", "pearson_de"]}
@@ -393,6 +432,8 @@ def compare_models_across_datasets(scgpt_perm_map, baseline_map, x_labels):
 def plot_model_losses():
     paths = [] 
     for root, dirs, files in os.walk("save/"):
+        if "archive" in root:
+            continue
         for file in files:
             if "loss_map" in file:
                 paths.append(os.path.join(root, file))
@@ -420,79 +461,15 @@ def plot_model_losses():
         plt.gcf().subplots_adjust(top=.76)
         plt.savefig(f"outputs/loss_curve_{path.replace('/', '_')}.png", dpi=300)
         
-def compare_shuffle_to_not(mode):
-    """
-    Plot deltas of scores when we don't do random shuffling of perturbation indices vs when we do
-    """
-    if mode == 1: 
-        x_labels = ["pearson", "pearson_de", "pearson_delta", "pearson_de_delta"] 
-    if mode == 2:
-        x_labels = ["mse", "mse_de", "pearson", "pearson_de"]
-    shuffle_dict = {boolean: {dataset: {x_label: [] for x_label in x_labels} for dataset in datasets} for boolean in [True, False]}
-    combined_paths = []
-    root_dirs = ["save/default_config_baseline", "save/shuffled_pert_token"]
-    for root_dir in root_dirs: 
-        for  directory in os.listdir(root_dir):
-            combined_paths.append(os.path.join(root_dir, directory))
-    for save_dir in combined_paths:    
-        shuffle_boolean = True if "shuffled" in save_dir else False 
-        ##get dataset that results are for 
-        dataset = get_dataset(save_dir)
-        if mode == 1:
-            res_file = os.path.join(save_dir, f"scGPT_pert_delta_results_{dataset}.pkl")
-        if mode == 2:
-            res_file = os.path.join(save_dir, f"scGPT_results_{dataset}.pkl")
-        if os.path.isfile(res_file): 
-            if mode == 1:
-                model_res = pickle.load(open(res_file, "rb"))
-            if mode == 2:
-                model_res, _ = pickle.load(open(res_file, "rb"))
-            ##write to shuffle_dict
-            for key in x_labels:
-                shuffle_dict[shuffle_boolean][dataset][key].append(model_res[key])
-    ##consolidate lists to summary mean and std statistics
-    for boolean in shuffle_dict:
-        for dataset in shuffle_dict[boolean]:
-            for metric in shuffle_dict[boolean][dataset]:
-                shuffle_dict[boolean][dataset][metric] = np.mean(shuffle_dict[boolean][dataset][metric]), np.std(shuffle_dict[boolean][dataset][metric])
-    ##plot delta plots, expect negative delta for MSEs and positive deltas for Pearsons
-    fig, ax = plt.subplots()
-    x = np.array(range(0, len(x_labels)))
-    ax.set_xticks(x)
-    width = 0.30
-    for dataset in datasets:
-        y = [shuffle_dict[False][dataset][metric][0] - shuffle_dict[True][dataset][metric][0] for metric in x_labels] ##the delta
-        ax.bar(x, y, width=width, label=f"{dataset.capitalize()} Dataset Delta")
-        for i,j in zip(x, y):
-            ax.annotate("{:.02}".format(j), xy=(i - .05, j),fontsize=5)
-        x = x + width
-    ax.hlines(y=0.0, xmin=0, xmax=len(x_labels), linestyles="dashed", color="black", linewidth=0.5)
-    plt.title("Effect on Performance of Randomly Shuffling Perturbation Indices")
-    ax.set_xticklabels(x_labels, fontsize=8)
-    plt.xticks(rotation=15)
-    ax.set_ylabel("Delta Scores (no shuffling - shuffling)")
-    box = ax.get_position()
-    ax.set_position([box.x0, box.y0, box.width, box.height * 0.85])
-    ax.legend(loc='upper right', prop={"size":7}, bbox_to_anchor=(1, 1.32))
-    plt.gcf().subplots_adjust(top=.76)
-    plt.savefig(f"outputs/random_shuffle_control_{mode}.png", dpi=300)
-
 def plot_cell_and_pert_counts():
+    datasets = ["adam_corrected_upr", "norman", "replogle_k562_essential"]
     splits = ["train", "val", "test"]
     metrics = ["data_size", "perturbations"]
     gene_set_dict = {data_name: set() for data_name in datasets} 
     perturbation_dict = {data_name: {split: set() for split in splits} for data_name in datasets}
     data_size_dict = {data_name: {split: -1 for split in splits} for data_name in datasets}
     for data_name in datasets:
-        if data_name in ["adamson", "norman", "replogle_k562_essential"]: 
-            pert_data = PertData("./data")
-            pert_data.load(data_name=data_name) ##seems to instantiate a lot of PertData attributes
-            pert_data.prepare_split(split="simulation", seed=1)
-            pert_data.get_dataloader(batch_size=64, test_batch_size=64)
-        if data_name == "replogle_k562_gwps":
-            pert_data = get_replogle_gwps_pert_data(split="simulation", batch_size=64, test_batch_size=64, generate_new=False)
-        if "replogle" in data_name:
-            modify_pertdata_dataloaders(pert_data, logger=None)
+        pert_data = get_pert_data(data_name)        
         gene_set_dict[data_name] = set(pert_data.adata.var["gene_name"].tolist())
         for load_type in splits:
             loader = pert_data.dataloader[f"{load_type}_loader"]
@@ -546,7 +523,6 @@ def plot_cell_and_pert_counts():
         fig, ax = venn.venn4(labels, names=datasets)
     plt.title("Gene Overlap Between Datasets")
     plt.savefig(f"outputs/venn_diagram_gene_overlap.png", dpi=300)
-
     ##overlap of perturbations between datasets
     ##get dataset to set of pertubations mapping
     dataset_to_pert_set = {data_name: perturbation_dict[data_name]["train"].union(perturbation_dict[data_name]["val"]).union(perturbation_dict[data_name]["test"]) for data_name in datasets}
@@ -645,57 +621,22 @@ def get_weight_similarity():
         plt.ylim((-1.1, 1.1))
         plt.savefig(f"outputs/weight_sim_{model_2}_{model_1}.png", dpi=300)
 
-def test_x_y_dataloaders():
-    """
-    For each dataset dataloader, make sure each array in .x and .y are what we think they are:
-    for control x_i = y_i, for perturbed check if array is present in adata.X.A and perturbation matches
-    """
-    for data_name in datasets:
-        if data_name in ["adamson", "norman", "replogle_k562_essential"]: 
-            pert_data = PertData("./data")
-            pert_data.load(data_name=data_name) ##seems to instantiate a lot of PertData attributes
-            pert_data.prepare_split(split="simulation", seed=1)
-            pert_data.get_dataloader(batch_size=64, test_batch_size=64)
-        if data_name == "replogle_k562_gwps":
-            pert_data = get_replogle_gwps_pert_data(split="simulation", batch_size=64, test_batch_size=64, generate_new=False)
-        if "replogle" in data_name:
-            modify_pertdata_dataloaders(pert_data, logger=None)
-        for batch, batch_data in enumerate(pert_data.dataloader["test_loader"]):
-            batch_size = len(batch_data.y)
-            x = batch_data.x  # (batch_size * n_genes, 2)  
-            ori_gene_values = x[:, 0].view(batch_size, len(batch_data.y[0]))
-            for i in range(0, len(batch_data)):
-                if batch_data.pert[i] == "ctrl":
-                    assert(torch.equal(ori_gene_values[i], batch_data.y[i])) ##for control, x_i == y_i
-                    sc_expr = ori_gene_values[i].numpy()
-                    found = False
-                    for j, array in enumerate(pert_data.adata.X.A):
-                        if np.array_equal(array, sc_expr):
-                            assert(pert_data.adata.obs["condition"][j] == 'ctrl') ##make sure array is found and that corresponding condition in adata == ctrl 
-                            found = True
-                            break
-                    if found == False:
-                        raise Exception("not found")
-                else:
-                    sc_expr = batch_data.y[i].numpy()
-                    found = False
-                    for j, array in enumerate(pert_data.adata.X.A):
-                        if np.array_equal(array, sc_expr):
-                            assert(pert_data.adata.obs["condition"][j] != "ctrl")
-                            assert(batch_data.pert[i] in pert_data.adata.obs["condition"][j]) ##make sure condition matches
-                            found = True
-                            break
-                    if found == False:
-                        raise Exception("not found")
-
 def find_best_models(mode=1):
+    """
+    Returns a map from model to path with highest score
+    will also print a mapping from directory to best model contained within that directory by dataset
+    """
     ##find all paths to result files within save, check if part of a multi-run 
     model_types = ["scgpt", "simple_affine", "gears", "linear_additive", "latent_additive", "decoder_only"]
+    # root_dirs = ["save/default_config_baseline/", "save/simple_affine/", "save/perturbench/", "pickles/gears_results/"]
+    root_dirs = ["save/no_pretraining/", "save/default_config_baseline/", "save/simple_affine/", "save/simple_affine_with_pretraining/", "save/perturbench/", "pickles/gears_results/"]
+    directory_to_best = {root: {dataset: ("", 0) for dataset in datasets} for root in root_dirs}
     paths = [] 
-    root_dirs = ["save/default_config_baseline", "save/simple_affine", "pickles/gears_results/", "save/perturbench/"]
     for root_dir in root_dirs:
         for root, dirs, files in os.walk(root_dir):
             for file in files:
+                if "result" not in file:
+                    continue
                 model_type = get_model_type(file)
                 if model_type not in model_types:
                     continue
@@ -704,21 +645,31 @@ def find_best_models(mode=1):
                     continue
                 if mode == 2 and "_results" in file and "pert_delta" not in file:
                     paths.append(os.path.join(root, file))
+
     ##iterate over file paths and find best model on test set 
     best_map = {model_type: {dataset: ("", 0) for dataset in datasets} for model_type in model_types}
     for path in paths: 
         ##get dataset that results are for 
         dataset = get_dataset(path)
+        if dataset not in best_map[model_type]:
+            continue
         model_type = get_model_type(path)
         if mode == 1: 
             model_res = pickle.load(open(path, "rb"))
-            score = model_res["pearson_de_delta"]
+            score = model_res["pearson_delta"] ##or can use pearson_de_delta
         else:
             model_res, _ = pickle.load(open(path, "rb"))
             score = model_res["pearson"]
-        
         if score > best_map[model_type][dataset][1]:
             best_map[model_type][dataset] = (path, score)
+        for root_dir in root_dirs:
+            if root_dir in path and score > directory_to_best[root_dir][dataset][1]:
+                directory_to_best[root_dir][dataset] = (path, score)
+    print(best_map, "\n")
+    for root_dir in root_dirs:
+        for dataset in datasets:
+            print(root_dir, dataset, directory_to_best[root_dir][dataset])
+        print("\n")
     return best_map
 
 def plot_wasserstein_pert_gene_comparison():
@@ -727,15 +678,20 @@ def plot_wasserstein_pert_gene_comparison():
     1: target gene T:              expression of target gene in cells perturbed by query  <--> expression of target gene in cells perturbed by something other than query 
     2: de genes != target gene:  expression of de genes != target gene for cells perturbed by query  <--> expression of de genes != target gene for cells perturbed by something other than query 
     """
+    datasets = ["adam_corrected_upr", "norman", "replogle_k562_essential"]
     dataset_to_w = {data_name: () for data_name in datasets} ##key: dataset, value: (w1 mean, w1 std, w1 len, w2 mean, w2 std, w2 len)
     ##iterate over each dataset and compute wassersteins from test set 
     for data_name in datasets: 
-        pert_data = PertData("./data")
-        pert_data.load(data_name=data_name)
-        pert_data.prepare_split(split="simulation", seed=1)
-        pert_data.get_dataloader(batch_size=64, test_batch_size=64)
-        if "replogle" in data_name:
-            modify_pertdata_anndata(pert_data)
+       
+        pert_data = get_pert_data(data_name)
+        # pert_data = PertData("./data")
+        # pert_data.load(data_name=data_name)
+        # pert_data.prepare_split(split="simulation", seed=1)
+        # pert_data.get_dataloader(batch_size=64, test_batch_size=64)
+        # if "replogle" in data_name:
+        #     modify_pertdata_anndata(pert_data)
+
+        
         adata = pert_data.adata
         wasserstein_1_list, wasserstein_2_list = [], []
         for query in set(adata.obs["condition"]): 
@@ -772,7 +728,7 @@ def plot_wasserstein_pert_gene_comparison():
     ##plot using data from dataset_to_w
     fig, ax = plt.subplots()
     x_labels = [f"Target gene T", f"DE Genes ≠ T"]
-    color_map = {"adamson": "lightsteelblue", "norman": "tan", "replogle_k562_essential": "slategrey"}
+    color_map = {"adam_corrected": "lightsteelblue", "adam_corrected_upr": "lightsteelblue", "adamson": "lightsteelblue", "norman": "tan", "replogle_k562_essential": "slategrey"}
     spacer = -0.4
     widths = 0.3
     for data_name in datasets: 
@@ -800,14 +756,25 @@ def plot_avg_pearson_to_avg_perturbed_state():
     For each target T, compute the pearson between (1) average of cells with target = T and (2) average of perturbed cells with target != T
     Plot boxplots of distributions
     """
+    datasets = ["adam_corrected_upr", "norman", "replogle_k562_essential"]
     dataset_map = {dataset: "" for dataset in datasets}
     for dataset in datasets: 
-        pert_data = PertData("./data")
-        pert_data.load(data_name=dataset)
-        pert_data.prepare_split(split="simulation", seed=1)
-        pert_data.get_dataloader(batch_size=64, test_batch_size=64)
-        if "replogle" in dataset:
-            modify_pertdata_anndata(pert_data)
+
+        pert_data = get_pert_data(dataset)
+        # if data_name in ["adamson", "norman", "replogle_k562_essential"]: 
+        #     pert_data = PertData("./data")
+        #     pert_data.load(data_name=data_name)
+        #     pert_data.prepare_split(split="simulation", seed=1)
+        #     pert_data.get_dataloader(batch_size=64, test_batch_size=64)
+        # if data_name == "adam_corrected":
+        #     pert_data = get_adam_corrected_dataset(split="simulation", batch_size=64, test_batch_size=64, generate_new=False, just_upr=False)
+        # if data_name == "adam_corrected_upr":
+        #     pert_data = get_adam_corrected_dataset(split="simulation", batch_size=64, test_batch_size=64, generate_new=False, just_upr=True)
+        # if data_name == "replogle_k562_gwps":
+        #     pert_data = get_replogle_gwps_pert_data(split="simulation", batch_size=64, test_batch_size=64, generate_new=False)
+        # if "replogle" in dataset:
+        #     modify_pertdata_anndata(pert_data)
+        
         adata = pert_data.adata 
         perturbed_adata = adata[adata.obs["condition"] != "ctrl"]
         perturbed_adata_values = perturbed_adata.to_df().values
@@ -853,12 +820,12 @@ def plot_rank_scores(mode=1, include_perturbench=False):
     model_types = ["gears", "mean_perturbed", "smart_mean_perturbed", "scgpt", "linear_additive", "latent_additive", "decoder_only"]
     proper_x_labels = {"gears": "GEARS", "scgpt": "scGPT", "mean_perturbed": "Mean", "smart_mean_perturbed": "CRISPR-informed\nMean", "linear_additive": "Linear Additive", "latent_additive": "Latent Additive", "decoder_only": "Decoder Only"}
     width = 0.15
-    color_map = {"adamson": "lightsteelblue", "norman": "tan", "replogle_k562_essential": "slategrey"}
+    color_map = {"adam_corrected": "lightsteelblue", "adam_corrected_upr": "lightsteelblue", "adamson": "lightsteelblue", "norman": "tan", "replogle_k562_essential": "slategrey"}
     spacer = -0.4
     widths = 0.3
     scgpt_vs_smart = []
     gears_vs_smart = []
-    for dataset in datasets:
+    for dataset in ["adam_corrected_upr", "norman", "replogle_k562_essential"]:
         gears_best_run_file = best_models["gears"][dataset][0]
         gears_best_run_number = find_best_run_number(gears_best_run_file, "gears")
         ##for boxplot
@@ -904,24 +871,22 @@ def plot_rank_scores(mode=1, include_perturbench=False):
     plt.savefig(f"outputs/rank_metrics.png", dpi=300)
     
 def plot_simple_affine_run_times():
+    datasets = ["adam_corrected_upr", "norman", "replogle_k562_essential"]
     model_map = {dataset: {"Simple Affine": ["save/simple_affine/", []], "scGPT": ["save/default_config_baseline/", []]} for dataset in datasets}
     for dataset in model_map: 
         for model in model_map[dataset]:
             for root, dirs, files in os.walk(model_map[dataset][model][0]):
                 for file in files:
-                    if ".log" in file and dataset in root:
+                    if ".log" in file and dataset == get_dataset(root):
                         with open(os.path.join(root, file)) as file:
                             for line in file:
                                 if "time: " in line:
-                                    elapsed_time = float(re.findall(r"time: [0-9]+.[0-9]+s", line)[0].split("time: ")[1].replace("s", ""))
+                                    elapsed_time = float(re.findall(r"time:\s+[0-9]+.[0-9]+s", line)[0].split("time: ")[1].replace("s", "")) #/s+ captures any number of white spaces, when t < 10 seconds will have double white space
                                     model_map[dataset][model][1].append(elapsed_time)
     ##codense to avg and std 
     for dataset in model_map:
         for model in model_map[dataset]:
             model_map[dataset][model][1] = (np.mean(model_map[dataset][model][1]), np.std(model_map[dataset][model][1]))
-    print(model_map)
-    for dataset in model_map:
-        print(f"{dataset}: {model_map[dataset]['scGPT'][1][0]  / model_map[dataset]['Simple Affine'][1][0]}")
     ##make bar graph comparisons, x-axis = model, y-axis = time, legend by dataset
     fig, ax = plt.subplots()
     width = 0.15
@@ -929,7 +894,7 @@ def plot_simple_affine_run_times():
     ax.set_xticks(x)
     x_labels = ["Simple Affine", "scGPT"]
     ax.set_xticklabels(x_labels)
-    color_map = {"adamson": "lightsteelblue", "norman": "tan", "replogle_k562_essential": "slategrey"}
+    color_map = {"adam_corrected": "lightsteelblue", "adam_corrected_upr": "lightsteelblue", "adamson": "lightsteelblue", "norman": "tan", "replogle_k562_essential": "slategrey"}
     for dataset in model_map:
         y = [model_map[dataset][x_label][1][0] for x_label in x_labels]
         yerr = [model_map[dataset][x_label][1][1] for x_label in x_labels]
@@ -1014,6 +979,8 @@ def plot_perturbench_comparison(mode):
                 paths.append(os.path.join(root, file))
     for path in paths: 
         dataset = get_dataset(path)
+        if dataset not in dataset_map.keys():
+            continue
         x_labels = list(dataset_map[dataset]["gears"].keys())
         baseline_y_std_map = get_baseline_y_std_map(dataset_map, dataset, x_labels)
         baseline_map[dataset] = baseline_y_std_map
@@ -1063,20 +1030,320 @@ def plot_perturbench_comparison(mode):
         plt.gcf().subplots_adjust(top=.76)
         plt.savefig(f"outputs/perturbench_comparison_{dataset}_mode={mode}.png", dpi=300)
 
-shutil.rmtree("outputs/")       
-os.mkdir("outputs/")  
 
-get_avg_baseline(mode=1)
-plot_model_scores(mode=1)
-plot_subset_model_scores(mode=1)
-plot_perturbench_comparison(mode=1)
-plot_rank_scores(mode=1, include_perturbench=True)
-plot_cell_and_pert_counts()
-plot_simple_affine_run_times()
-compare_number_model_params()
-plot_avg_pearson_to_avg_perturbed_state()
-plot_wasserstein_pert_gene_comparison()
-find_best_models(mode=1)
-plot_model_losses()
-compare_shuffle_to_not(mode=1)
-test_x_y_dataloaders()
+def make_metric_violinplots(dir = '', output_prefix='violinplot', exclude_target_gene=False, exclude_combos=False):
+    """
+    function written by Abby for supplemental figure
+    dir = relative path to dataset files
+    output_prefix = beginning of path to save the output plot
+    exclude_target_gene = whether to exclude the gene that was perturbed and the condition where the gene was targeted
+    exclude_combos = whether to exclude combination perturbations
+    """
+    for dataset in datasets: 
+        print(f'exclude combos 0: {exclude_combos}')
+        # Find all pickle files with the given prefix
+        pickle_files = glob.glob(f"{dir}pert_data_structure*{dataset}_run*.pkl")
+        # Initialize an empty DataFrame to store all data
+        model_names = []
+        all_data = pd.DataFrame()
+        # Loop through each pickle file and concatenate the data
+        all_gene_level_metrics_df = pd.DataFrame()
+        all_perturbation_level_metrics_df = pd.DataFrame()
+        for pickle_file in pickle_files:
+            print(f"pickle_file: {pickle_file}")
+            # get model name from filename
+            print(f"dataset: {dataset}")
+            dataset_first_appearance = dataset+'_s' # dataset name is followed by either _scGPT or _simple_affine
+            dataset_second_appearance = dataset+'_r' # dataset name is followed by _run
+            start = pickle_file.find(dataset_first_appearance) + len(dataset_first_appearance) - 1
+            end = pickle_file.find(dataset_second_appearance) - 1
+            model_name = pickle_file[start:end].replace('_load_save_','_')
+            print(f"model_name: {model_name}")
+            model_names.append(model_name)
+            with open(pickle_file, 'rb') as file:
+                data = pickle.load(file)
+            data = find_combine_redundant_conditions(data)
+            [model_preds_df, actual_data_df, control_means_df] = model_res_to_dfs(data)
+            model_preds_df = clean_up_data(dataset, model_preds_df)
+            actual_data_df = clean_up_data(dataset, actual_data_df)
+            control_means_df = clean_up_data(dataset, control_means_df)
+            current_model_gene_level_metrics = get_gene_level_metrics(model_preds_df, actual_data_df, gene_names=model_preds_df.index, exclude_target_gene=exclude_target_gene, exclude_combos=exclude_combos)
+            current_model_gene_level_metrics.columns = [col + f'_{model_name}' for col in current_model_gene_level_metrics.columns]
+            all_gene_level_metrics_df = pd.concat([all_gene_level_metrics_df, current_model_gene_level_metrics], axis=1)
+            current_model_perturbation_level_metrics = get_perturbation_level_metrics(model_preds_df, actual_data_df, control_means_df, perturbation_labels = model_preds_df.columns, exclude_target_gene=exclude_target_gene, exclude_combos=exclude_combos)
+            current_model_perturbation_level_metrics.columns = [col + f'_{model_name}' for col in current_model_perturbation_level_metrics.columns]
+            all_perturbation_level_metrics_df = pd.concat([all_perturbation_level_metrics_df, current_model_perturbation_level_metrics], axis=1)
+        fig, ax = plt.subplots(1, 2, figsize=(12, 6))
+        # gene-level violin plot
+        gene_plot_data = all_gene_level_metrics_df[['Pearson_correlation_simple_affine_simple_affine','Pearson_correlation_simple_affine_simple_affine_with_pretraining', 'Pearson_correlation_scGPT_no_pretraining', 'Pearson_correlation_scGPT_default_config_baseline']]
+        num_genes = gene_plot_data.shape[0]
+        print(num_genes)
+        if num_genes < 500:
+            sns.swarmplot(data=gene_plot_data, ax=ax[0])
+        else:
+            sns.violinplot(data=gene_plot_data, ax=ax[0])
+        # fix x-axis labels
+        new_labels = ['Simple Affine no pretraining', 'Simple Affine pretrained', 'scGPT no pretraining', 'scGPT pretrained']
+        ax[0].set_xticklabels(new_labels)
+        ax[0].set_title(f'{get_dataset_title(dataset)}: Gene-level Pearson Correlation')
+        ax[0].set_xlabel('Model')
+        ax[0].set_ylabel('Pearson Correlation (for Genes)')
+        ax[0].set_ylim(-1.3, 1.3)
+        # perturbation-level violin plot
+        pert_plot_data = all_perturbation_level_metrics_df[['Pearson_delta_simple_affine_simple_affine','Pearson_delta_simple_affine_simple_affine_with_pretraining', 'Pearson_delta_scGPT_no_pretraining', 'Pearson_delta_scGPT_default_config_baseline']]
+        num_perts = pert_plot_data.shape[0]
+        if num_perts < 500:
+            sns.swarmplot(data=pert_plot_data, ax=ax[1], size=3)
+        else:
+            sns.violinplot(data=pert_plot_data, ax=ax[1], size=3)
+        # fix x-axis labels
+        ax[1].set_xticklabels(new_labels)
+        ax[1].set_title(f'{get_dataset_title(dataset)}: Perturbation-level Pearson Deltas')
+        ax[1].set_xlabel('Model')
+        ax[1].set_ylabel('Pearson Delta (for Perturbations)')
+        ax[1].set_ylim(-1.3, 1.3)
+        for axis in ax:
+            for label in axis.get_xticklabels():
+                label.set_rotation(45)
+        plt.subplots_adjust(bottom=0.3)
+        # Save or show the plot
+        if output_prefix:
+            plt.savefig(f'{output_prefix}genes_and_perturbation_deltas_{dataset}_et_{exclude_target_gene}_ec_{exclude_combos}.png', dpi=300)
+        else:
+            plt.show()
+
+def find_combine_redundant_conditions(data):
+    """
+    function written by Abby to combine values for conditions like GENE+ctrl and ctrl+GENE (appears in Norman data, maybe other datasets with combination perturbations)
+    """
+    conditions = list(data.keys())
+    for condition in conditions:
+        # strip off 'ctrl' part of the condition to find the actual gene name
+        gene = condition.replace('ctrl+','')
+        gene = gene.replace('+ctrl','')
+        if f'ctrl+{gene}' in condition:
+            print(f'found ctrl+{gene}')
+            corresponding_condition = f'{gene}+ctrl'
+            if corresponding_condition in conditions:
+                print(f'found corresponding condition {corresponding_condition}')
+                data = combine_conditions(data, corresponding_condition, condition)
+            print(data.keys())
+    return data
+
+def combine_conditions(data, condition1, condition2):
+    """
+    helper function written by Abby
+    """
+    if condition1 in data and condition2 in data:
+        data[condition1]['all_truth'] = np.concatenate((data[condition1]['all_truth'], data[condition2]['all_truth']))
+        data[condition1]['all_pred'] = np.concatenate((data[condition1]['all_pred'], data[condition2]['all_pred']))
+        del data[condition2]
+    return data
+
+def model_res_to_dfs(pert_struct):
+    """
+    helper function written by Abby - puts model results from pickle file into a DataFrame
+    """
+    # Initialize dictionaries to collect mean predictions and actual values
+    pred_dict = {}
+    actual_dict = {}
+    # Iterate over the dictionary to calculate the mean predictions for each condition
+    for condition, values in pert_struct.items():
+        # Ensure the structure is as expected
+        if 'all_genes' in values and 'all_pred' in values:
+            gene_names = values['all_genes']
+            predictions = values['all_pred'].transpose()
+            actual = values['all_truth'].transpose()
+            # Ensure predictions is a 2D array-like structure
+            if not isinstance(predictions, (list, np.ndarray)) or not all(isinstance(row, (list, np.ndarray)) for row in predictions):
+                raise ValueError(f"'predictions' should be a 2D array-like structure in condition: {condition}")
+            # Convert predictions to a DataFrame and calculate the mean across cells
+            predictions_df = pd.DataFrame(predictions, index=gene_names)
+            actual_df = pd.DataFrame(actual, index=gene_names)
+            mean_predictions = predictions_df.mean(axis=1)
+            mean_actual = actual_df.mean(axis=1)
+            # Collect the mean predictions and actual values in the dictionaries
+            pred_dict[condition] = mean_predictions
+            actual_dict[condition] = mean_actual
+        else:
+            if condition != 'actual_mean_perturbed':
+                print(f"Missing 'all_genes' or 'all_pred' in condition: {condition}")
+        # also get control means to use for deltas:
+        if 'all_ctrl_means' in values:
+            control_means_df = pd.DataFrame(values['all_ctrl_means'].transpose(), index=gene_names)
+        else:
+            if condition !='actual_mean_perturbed':
+                print(f"Missing 'all_ctrl_means' in condition: {condition}")
+    # Create DataFrames from the collected mean predictions and actual values
+    preds_df = pd.concat(pred_dict, axis=1)
+    preds_df.columns = [x.replace('+ctrl','').replace('ctrl+','') for x in preds_df.columns]
+    actual_df = pd.concat(actual_dict, axis=1)
+    actual_df.columns = [x.replace('+ctrl','').replace('ctrl+','') for x in actual_df.columns]
+    return [preds_df, actual_df, control_means_df]
+
+def clean_up_data(dataset, dataframe):
+    """
+    helper function written by Abby
+    """
+    if dataset=='replogle_k562_essential':
+        # There are two rows (two genes in original data) with gene symbol TBCE. Want to rename to TBCE-0 and TBCE-1
+        # find all indices named 'TBCE'
+        tbce_indices = dataframe.index[dataframe.index == 'TBCE']
+        # Create a new index with the renamed entries
+        new_index = []
+        tbce_count = 0
+        for idx in dataframe.index:
+            if idx == 'TBCE':
+                new_index.append(f'TBCE-{tbce_count}')
+                tbce_count += 1
+            else:
+                new_index.append(idx)
+        # Assign the new index to the DataFrame
+        dataframe.index = new_index
+    return dataframe
+
+def get_gene_level_metrics(preds_df, actual_df, gene_names, exclude_target_gene=False, exclude_combos=False):
+    """
+    helper function written by Abby - calculate metrics (Pearson correlation, MSE, R2) for each gene across perturbations
+    """
+    # Initialize lists to store results
+    correlations = []
+    p_values = []
+    RMSE = []
+    MSE = []
+    R2 = []
+    print(f'exclude combos: {exclude_combos}')
+    # transpose dataframes for gene-level metrics
+    preds_df = preds_df.transpose()
+    actual_df = actual_df.transpose()
+    # Loop through each gene name
+    for gene_name in gene_names:
+        if exclude_target_gene:
+            # Exclude rows with index that matches the gene name
+            current_preds_df = preds_df[preds_df.index != gene_name]
+            current_actual_df = actual_df[actual_df.index != gene_name]
+        else:
+            current_preds_df = preds_df
+            current_actual_df = actual_df
+        if exclude_combos:
+            # Get columns that do not have '+' in the column name
+            filtered_rows = [row for row in current_preds_df.index if '+' not in row]
+            # Create a new DataFrame with the filtered columns
+            current_preds_df = current_preds_df[~current_preds_df.index.str.contains('\+')]
+            current_actual_df = current_actual_df[~current_actual_df.index.str.contains('\+')]
+        # Extract the relevant data for the specified gene
+        if gene_name not in current_preds_df.columns:
+            raise ValueError(f"Column {gene_name} not found in current_preds_df.")
+        if gene_name not in current_actual_df.columns:
+            raise ValueError(f"Column {gene_name} not found in current_actual_df.")
+        actual_data = current_actual_df[gene_name]
+        pred_data = current_preds_df[gene_name]
+        # Calculate the Pearson correlation coefficient
+        correlation, p_value = scipy.stats.pearsonr(actual_data, pred_data)
+        # calculate (R)MSE
+        mse = sklm.mean_squared_error(actual_data, pred_data)
+        # depends on version of scikit-learn whether you need root_mean_squared_error or squared=False
+        # rmse = sklm.root_mean_squared_error(actual_data, pred_data)
+        rmse = sklm.mean_squared_error(actual_data, pred_data, squared=False)
+        # calculate r-squared
+        r2 = sklm.r2_score(actual_data, pred_data)
+        # Append results to lists
+        correlations.append(correlation)
+        p_values.append(p_value)
+        RMSE.append(rmse)
+        MSE.append(mse)
+        R2.append(r2)
+    # Create a DataFrame with the results
+    results_df = pd.DataFrame({
+        'Pearson_correlation': correlations,
+        'p_value': p_values,
+        'RMSE': RMSE,
+        'MSE': MSE,
+        'R2': R2
+    }, index=gene_names)
+    return results_df
+
+def get_perturbation_level_metrics(preds_df, actual_df, control_means_df, perturbation_labels, exclude_target_gene=False, exclude_combos=False):
+    """
+    helper function written by Abby - calculate metrics (Pearson correlation, Pearson delta, RMSE, MSE, R2) for each perturbation across all genes; comparable to previous publications
+    """
+    # Initialize lists to store results
+    correlations = []
+    delta_correlations = []
+    RMSE = []
+    MSE = []
+    R2 = []
+    delta_R2 = []
+    if exclude_combos:
+        perturbation_labels = [p for p in perturbation_labels if '+' not in p]
+    # Loop through each gene name
+    for perturbation in perturbation_labels:
+        if exclude_target_gene:
+            # Exclude rows with index that matches the gene name
+            # this would need to be modified to work properly for combinations of perturbations
+            current_preds_df = preds_df[~preds_df.index.str.contains(perturbation)]
+            current_actual_df = actual_df[~actual_df.index.str.contains(perturbation)]
+            current_control_means_df = control_means_df[~control_means_df.index.str.contains(perturbation)]
+        else:
+            current_preds_df = preds_df
+            current_actual_df = actual_df
+            current_control_means_df = control_means_df
+        # get delta (difference between actual-mean of control cells or predicted-mean of control cells)
+        current_preds_delta_df = current_preds_df.subtract(current_control_means_df[0], axis=0)
+        current_actual_delta_df = current_actual_df.subtract(current_control_means_df[0], axis=0)
+        if perturbation not in current_preds_df.columns or perturbation not in current_actual_df.columns:
+            raise ValueError(f"Columns {perturbation} not found in the DataFrame.")
+        actual_data = current_actual_df[perturbation]
+        actual_delta = current_actual_delta_df[perturbation]
+        pred_data = current_preds_df[perturbation]
+        pred_delta = current_preds_delta_df[perturbation]
+        # Calculate the Pearson correlation coefficient
+        correlation, p_value = scipy.stats.pearsonr(actual_data, pred_data)
+        delta_correlation, delta_p_value = scipy.stats.pearsonr(actual_delta, pred_delta)
+        # calculate (R)MSE
+        # depends on version of scikit learn which of the two below lines you should use
+        # rmse = sklm.root_mean_squared_error(actual_data, pred_data)
+        rmse = sklm.mean_squared_error(actual_data, pred_data, squared=False)
+        mse = sklm.mean_squared_error(actual_data, pred_data)
+        # calculate r-squared
+        r2 = sklm.r2_score(actual_data, pred_data)
+        delta_r2 = sklm.r2_score(actual_delta, pred_delta)
+        # Append results to lists
+        correlations.append(correlation)
+        delta_correlations.append(delta_correlation)
+        RMSE.append(rmse)
+        MSE.append(mse)
+        R2.append(r2)
+        delta_R2.append(delta_r2)
+    # Create a DataFrame with the results
+    results_df = pd.DataFrame({
+        'Pearson_correlation': correlations,
+        'Pearson_delta': delta_correlations,
+        'RMSE': RMSE,
+        'MSE': MSE,
+        'R2': R2,
+        'delta_R2': delta_R2
+    }, index=perturbation_labels)
+    return results_df
+
+
+# shutil.rmtree("outputs/")       
+# os.mkdir("outputs/")  
+
+# plot_rank_scores(mode=1, include_perturbench=True)
+# plot_simple_affine_run_times()
+# compare_number_model_params()
+# get_avg_baseline(mode=1)
+# plot_subset_model_scores(mode=1)
+# plot_perturbench_comparison(mode=1)
+# plot_model_scores(mode=1)
+# make_metric_violinplots(dir="/hpfs/projects/mlcs/mlhub/perturbseq/scGPT_baseline_results/", output_prefix="outputs/", exclude_target_gene=False, exclude_combos=True)
+# make_metric_violinplots(dir="/hpfs/projects/mlcs/mlhub/perturbseq/scGPT_baseline_results/", output_prefix="outputs/", exclude_target_gene=False, exclude_combos=False)
+
+# plot_cell_and_pert_counts()
+# plot_avg_pearson_to_avg_perturbed_state()
+# plot_wasserstein_pert_gene_comparison()
+
+
+# plot_model_losses()
+# find_best_models(mode=1)
