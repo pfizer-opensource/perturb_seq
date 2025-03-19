@@ -332,6 +332,59 @@ def eval_perturb(
     results["avg_loss"] = total_loss / float(len(loader.dataset))
     return results
 
+def get_condition_performance_breakdown(results, ctrl_adata):
+    """
+    Given output from eval_perturb, compute pertubation specific performance 
+    """
+    from scgpt.utils import find_DE_genes
+    mean_ctrl = np.array(ctrl_adata.X.mean(0)).flatten() 
+    conditions = np.unique(results["pert_cat"])
+    geneid2idx = dict(zip(ctrl_adata.var.index.values, range(len(ctrl_adata.var))))
+    de_idx = {c: find_DE_genes(ctrl_adata, c, geneid2idx, non_zero_genes=False)[0] for c in conditions}
+    condition2idx = {c: np.where(results["pert_cat"] == c)[0] for c in conditions} #condition to indices where condition occurs in conditions array 
+    condition_map = {}
+    for pert in conditions: 
+        pert_indices = condition2idx[pert]
+        pert_de_idx = de_idx[pert]
+        pert_pred = np.mean(results["pred"][pert_indices, :], axis=0)
+        pert_truth = np.mean(results["truth"][pert_indices, :], axis=0)
+        if np.sum(pert_pred[pert_de_idx]) == 0 or np.sum(pert_truth[pert_de_idx]) == 0: ##vector of all zeros will result in NaN pearson_de, skip 
+            print(f"WARNING: {pert} has 0 vector, will result in NaN pearson_de")
+        pearson = scipy.stats.pearsonr(pert_pred, pert_truth)[0]
+        pearson_delta =  scipy.stats.pearsonr(pert_pred - mean_ctrl , pert_truth - mean_ctrl)[0]
+        pearson_de = scipy.stats.pearsonr(pert_pred[pert_de_idx], pert_truth[pert_de_idx])[0]
+        pearson_de_delta = scipy.stats.pearsonr(pert_pred[pert_de_idx] - mean_ctrl[pert_de_idx], pert_truth[pert_de_idx] - mean_ctrl[pert_de_idx])[0]
+        condition_map[pert] = {"pearson": pearson, "pearson_de": pearson_de, "pearson_delta": pearson_delta, "pearson_de_delta": pearson_de_delta}
+    print("average results in get_condition_performance_breakdown: ")
+    for metric in ["pearson", "pearson_de", "pearson_delta", "pearson_de_delta"]:
+        print("    ", metric, np.nanmean([condition_map[pert][metric] for pert in condition_map]))
+    return condition_map
+
+def get_gene_performance_breakdown(results, ctrl_adata):
+    """
+    Given output from eval_perturb, compute gene specific performance
+    pearson between actual and predicted for each gene
+    note: no such concept as delta scores because pearson (x,y) == pearson (x-k, y-k) for constant k and vectors x,y
+    """
+    pred = results["pred"]
+    truth = results["truth"]
+    gene_list = ctrl_adata.var["gene_name"].tolist()
+    assert(len(gene_list) == len(pred[0]) == len(truth[0]))
+    gene_to_pearson_map = {gene: "" for gene in gene_list}
+    for i in range(0, len(gene_list)):
+        gene = gene_list[i]
+        if np.std(pred[:,i]) < 0.000001: ##mode collapse for models like mean, if std == 0 we cannot compute pearson (will be NaN), add very small random noise to prediction
+            pred_vector = pred[:,i] + np.random.rand(len(pred[:, i])) * 0.0000001
+        else: 
+            pred_vector = pred[:,i]
+        if np.std(pred[:,i]) < 0.000001:
+            truth_vector = truth[:,i] + np.random.rand(len(truth[:, i])) * 0.0000001
+        else:
+            truth_vector = truth[:,i]
+        corr_i = scipy.stats.pearsonr(pred_vector, truth_vector)[0]
+        gene_to_pearson_map[gene] = corr_i
+    return gene_to_pearson_map    
+
 def get_variables(load_model=None, config_path=None):
     """
     Reads config file and returns dictionary of variables
@@ -555,9 +608,88 @@ def modify_pertdata_dataloaders(pert_data, logger=None):
         for load_type in ["train", "val", "test"]:
             logger.info(f"    new {load_type} loader length: {len(pert_data.dataloader[f'{load_type}_loader'])}")
 
+def get_split(pert, pert_map):
+    """
+    Given a perturbation pert 
+    and a dictionary with key: split, value: list of perts
+    will return which split pert is found in
+    """
+    for split in pert_map:
+        if pert in pert_map[split]:
+            return split
+    return -1
+
+def cross_validate_split(pert_data, cross_validation_fold):
+    """
+    will modify PertData loaders to conform to the cross_validation fold 
+    4-fold, will have two be training, 1 be val, and 1 be test
+    each split has unique perturbations (minus control, which will be in just train)
+    """
+    print(f"WARNING: splitting data into cross validation fold {cross_validation_fold}")
+    ##get all perturbations in train/val/test, sort and then shuffle them by fixed seed so deterministic
+    old_dataloaders = pert_data.dataloader
+    all_perts = []
+    splits = ["train", "val", "test"]
+    for load_type in splits:
+        old_loader = old_dataloaders[f"{load_type}_loader"]
+        for batch, batch_data in enumerate(old_loader):
+            all_perts = all_perts + list(batch_data.pert)
+    all_perts = sorted(list(set(all_perts)))
+    all_perts.remove("ctrl") ##let's add ctrl back later to just the train perturbations
+    ##deterministically shuffle all_perts
+    g = torch.Generator()
+    g.manual_seed(0)
+    rand_indices = torch.randperm(len(all_perts), generator=g).tolist()
+    shuffled_perts = [all_perts[rand_index] for rand_index in rand_indices]
+    print(shuffled_perts)
+    ##chunk the list into folds
+    divisor = int(len(shuffled_perts) / 4)
+    chunk_1 = shuffled_perts[0: divisor]
+    chunk_2 = shuffled_perts[divisor: divisor * 2]
+    chunk_3 = shuffled_perts[divisor * 2: divisor * 3]
+    chunk_4 = shuffled_perts[divisor * 3: ]
+    ##assign train/val/test depending on fold
+    pert_map = {split: set() for split in splits}
+    if cross_validation_fold == 1:
+        pert_map["train"] = chunk_1 + chunk_2
+        pert_map["val"] = chunk_3
+        pert_map["test"] = chunk_4
+    if cross_validation_fold == 2:
+        pert_map["train"] = chunk_4 + chunk_1
+        pert_map["val"] = chunk_2
+        pert_map["test"] = chunk_3
+    if cross_validation_fold == 3:
+        pert_map["train"] = chunk_3 + chunk_4
+        pert_map["val"] = chunk_1
+        pert_map["test"] = chunk_2
+    if cross_validation_fold == 4:
+        pert_map["train"] = chunk_2 + chunk_3
+        pert_map["val"] = chunk_4
+        pert_map["test"] = chunk_1
+    pert_map["train"].append("ctrl")
+    ##now create new loaders and assign
+    new_data_map = {split: [] for split in splits}
+    for load_type in splits:
+        new_data = []
+        skipped = set()
+        old_loader = old_dataloaders[f"{load_type}_loader"]
+        for batch, batch_data in enumerate(old_loader): ##batch_data is of type torch_geometric.data.batch.DataBatch, batch_data[i] is of type torch_geometric.data.data.Data
+            for i in range(0, len(batch_data)):  
+                pert = batch_data.pert[i]  
+                my_split = get_split(pert, pert_map)  
+                new_data_map[my_split].append(batch_data[i])  
+    shuffle = {"train": True, "val":True, "test":False}
+    new_dataloaders = {}
+    for split in splits: 
+        new_loader = DataLoader(new_data_map[split], batch_size=old_loader.batch_size, shuffle=shuffle[load_type])
+        new_dataloaders[f"{split}_loader"] = new_loader 
+    pert_data.dataloader = new_dataloaders
+
 def check_args(opt):
     if opt.pretrain_control == True and opt.mode == "test":
         raise Exception("opt.pretrain_control == True and opt.mode == test")
+    if opt.cross_validation == True:
+        assert(opt.cross_validation_fold != None)
 
 def convert_ENSG_to_gene(ensg_list):
     """

@@ -13,9 +13,8 @@ import glob
 import sklearn.metrics as sklm
 import seaborn as sns
 
-
-datasets = ["adam_corrected", "adam_corrected_upr", "adamson", "norman", "replogle_k562_essential"]
-# datasets = ["adam_corrected_upr",  "norman", "replogle_k562_essential"]
+# datasets = ["adam_corrected", "adam_corrected_upr", "adamson", "norman", "replogle_k562_essential"]
+datasets = ["adam_corrected_upr",  "norman", "replogle_k562_essential"]
 
 def get_pert_data(data_name):
     if data_name in ["adamson", "norman", "replogle_k562_essential"]: 
@@ -100,6 +99,8 @@ def get_avg_baseline(mode):
                             assert(mean_map == baseline_map[f"{prefix}mean_{mean_type}"][dataset])
                         else:
                             baseline_map[f"{prefix}mean_{mean_type}"][dataset] = mean_map
+    ##save unreduced
+    pickle.dump(baseline_map, open(f"pickles/unreduced_baseline_default_mode={mode}.pkl", "wb"))
     ##reduce 
     for method in baseline_map:
         for dataset in baseline_map[method]:
@@ -135,7 +136,10 @@ def get_model_title_from_path(string):
     if "input_encoder_control" in string:
         return "scGPT (randomly initialized input encoder)"
     if "simple_affine" in string:
-        return "Simple Affine (no transformer)"
+        if "simple_affine_large" not in string:
+            return "Simple Affine (no transformer)"
+        else:
+            return "Simple Affine (replace transformer with MLP)"
     if "LoRa" in string:
         return "LoRa Fine-Tuned scGPT"
     return "Modified scGPT"
@@ -159,10 +163,10 @@ def get_model_type(string, formal=False):
         return "Training Mean" if formal else "baseline_mean"
     raise Exception(f"model for {string} not found")
     
-def get_path_results(path, paths, x_labels, mode):
+def get_path_results(path, paths, x_labels, mode, return_unreduced=False):
     """
     For a given path to results file:
-    will return the score and std as list, one entry for each of x_labels
+    will return the mean score (list - one entry for each of x_labels), std (list), and also original unreduced values (dict)
         if part of a mult-run: score will be the average across all runs
         if part of a singleton run: score will be the result of that one run, std will be 0 
     """
@@ -172,7 +176,7 @@ def get_path_results(path, paths, x_labels, mode):
         stripped_path = path.replace(run_number, "")
         same_run_paths = [p for p in paths if "run_" in p and p.replace(re.findall(r"run_[0-9]+", p)[0], "") == stripped_path]
         if len(same_run_paths) != 10:
-            raise Exception(f"path: {path}, len(same_run_paths) != 10")
+            print(f"WARNING: path: {path}, len(same_run_paths) = {len(same_run_paths)}")
         for index, srp in enumerate(same_run_paths):
             if mode == 1: 
                 model_res = pickle.load(open(srp, "rb"))
@@ -184,9 +188,9 @@ def get_path_results(path, paths, x_labels, mode):
                 for key in model_res: 
                     sr_results[key].append(model_res[key])
         ##avg reduce sr_results
-        sr_results = {key: (np.mean(sr_results[key]), np.std(sr_results[key])) for key in sr_results}
-        y_model = [sr_results[key][0] for key in x_labels]
-        y_model_std = [sr_results[key][1] for key in x_labels]
+        reduced_sr_results = {key: (np.mean(sr_results[key]), np.std(sr_results[key])) for key in sr_results}
+        y_model = [reduced_sr_results[key][0] for key in x_labels]
+        y_model_std = [reduced_sr_results[key][1] for key in x_labels]
     else: ##singleton run               
         if mode == 1: 
             model_res = pickle.load(open(path, "rb"))
@@ -194,7 +198,10 @@ def get_path_results(path, paths, x_labels, mode):
             model_res, _ = pickle.load(open(path, "rb"))
         y_model = [model_res[key] for key in x_labels]
         y_model_std = [0] * len(y_model)
-    return y_model, y_model_std
+    if return_unreduced:
+        return y_model, y_model_std, sr_results
+    else: 
+        return y_model, y_model_std
 
 def get_baseline_dataset_map(mode):
     """
@@ -237,10 +244,9 @@ def plot_model_scores(mode):
                 paths.append(os.path.join(root, file))
             if mode == 2 and f"_results" in file and "pert_delta" not in file:
                 paths.append(os.path.join(root, file))
-
+    print(paths)
     ##iterate over file paths and plot the results
     for path in paths: 
-        # try: 
         ##get dataset that results are for 
         dataset = get_dataset(path)
         if dataset not in dataset_map.keys():
@@ -301,9 +307,6 @@ def plot_model_scores(mode):
             plt.savefig(f"outputs/multirun_{prefix.replace('/', '_')}_mode={mode}.png", dpi=300)
         else:
             plt.savefig(f"outputs/{path.replace('/', '_')}_mode={mode}.png", dpi=300)
-        
-        # except Exception as e:
-            # print(f"Exception with path {path}: {e}")        
 
 def plot_subset_model_scores(mode, include_simple_affine=False):
     """
@@ -330,8 +333,10 @@ def plot_subset_model_scores(mode, include_simple_affine=False):
                     paths.append(os.path.join(root, file))
                 if mode == 2 and "_results" in file and "pert_delta" not in file:
                     paths.append(os.path.join(root, file))
+    unreduced_map = {perm: {dataset: "" for dataset in datasets} for perm in root_dirs} ##key: permutation, key: dataset, value: dictionary of metric key to list of scores, e.g. {save/no_pretraining: norman: {pearson: , pearson_de, ...}}
+    
     perm_map = {perm: {dataset: "" for dataset in datasets} for perm in root_dirs} ##key: permutation as directory path, key: dataset, value: (y_model, y_std)
-    baseline_map = {dataset: "" for dataset in datasets} #key dataset: value: baseline_y_std_map (key: model, value: tuple(scores list, std list) corresponding to x_labels)
+    baseline_map = {dataset: "" for dataset in datasets} #key dataset: value: baseline_y_std_map (key: model, value: tuple(avg scores list, std list) corresponding to x_labels)
     ##iterate over file paths and fill out perm_map
     for path in paths: 
         ##get dataset that results are for 
@@ -343,18 +348,23 @@ def plot_subset_model_scores(mode, include_simple_affine=False):
         baseline_y_std_map = get_baseline_y_std_map(dataset_map, dataset, x_labels)
         baseline_map[dataset] = baseline_y_std_map
         ##get results for this path to plot
-        y_model, y_model_std = get_path_results(path, paths, x_labels, mode)
-
+        y_model, y_model_std, unreduced = get_path_results(path, paths, x_labels, mode, return_unreduced=True)
         for key in perm_map:
             if key in path: 
                 assigned_key = key
                 break
+        if dataset in ["adam_corrected_upr", "norman", "replogle_k562_essential"]: ##only include the 3 core datasets in this calculation for statistical significance (for main results)
+            if unreduced_map[assigned_key][dataset] == "": 
+                unreduced_map[assigned_key][dataset] = unreduced
+
         if perm_map[assigned_key][dataset] != "":
             assert(perm_map[assigned_key][dataset] == (y_model, y_model_std)) ##this should be the same for paths of the same multi-run
         else:
             perm_map[assigned_key][dataset] = (y_model, y_model_std)
+    ##statistical t-test
+    get_p_val_comparisons(unreduced_map, x_labels)
     ##print model to model comparisons 
-    compare_models_across_datasets(perm_map, baseline_map, x_labels)
+    # compare_models_across_datasets(perm_map, baseline_map, x_labels)
     ##plot 
     for dataset in baseline_map.keys():
         fig, ax = plt.subplots()
@@ -391,43 +401,42 @@ def plot_subset_model_scores(mode, include_simple_affine=False):
         plt.gcf().subplots_adjust(top=.76)
         plt.savefig(f"outputs/aggregated_results_{dataset}_mode={mode}.png", dpi=300)
 
-def compare_models_across_datasets(perm_map, baseline_map, x_labels):
+def get_p_val_comparisons(unreduced_map, x_labels):
     """
-    Helper method for plot_subset_model_scores, will do pairwise model performance comparisons and print the pairwise differences of averages
+    Helper function for plot_subset_model_scores
+    will print out pairwise p-values for t-test 
     """
-    print(f"datasets used to calculate MAD scores: {baseline_map.keys()}")
-    model_pairs_map = {} ##key: (model1, model2) always sorted tuple, key: metric, value: list of (model1 avg - model2 avg)
-    for dataset in baseline_map:
-        model_pairs = itertools.combinations(set(list(baseline_map[dataset].keys()) + list(perm_map.keys())), 2)
-        model_pairs = [sorted(x) for x in model_pairs]
-        for i in range(0, len(x_labels)):
-            x_label = x_labels[i]
-            for m1, m2 in model_pairs:
-                if (m1, m2) not in model_pairs_map:
-                    model_pairs_map[(m1, m2)] = {x_l: [] for x_l in x_labels}
-                if m1 in baseline_map[dataset].keys():
-                    score1 = baseline_map[dataset][m1][0][i]
-                if m1 in perm_map.keys():
-                    score1 = perm_map[m1][dataset][0][i]
-                if m2 in baseline_map[dataset].keys():
-                    score2 =  baseline_map[dataset][m2][0][i]
-                if m2 in perm_map.keys():
-                    score2 = perm_map[m2][dataset][0][i]
-                # model_pairs_map[(m1, m2)][x_label].append(baseline_map[dataset][m1][0][i] - baseline_map[dataset][m2][0][i])
-                model_pairs_map[(m1, m2)][x_label].append(abs(score1 - score2))
-    ##drop pearson and pearson de
-    for key in model_pairs_map:
-        model_pairs_map[key] = {key2: model_pairs_map[key][key2] for key2 in model_pairs_map[key].keys() if key2 not in ["pearson", "pearson_de"]}
-    for key in model_pairs_map:
-        print(key)
-        print("   ", model_pairs_map[key])
-    ##consolidate to mean 
-    for m1,m2 in model_pairs_map: 
-        for metric in model_pairs_map[(m1,m2)]:
-            model_pairs_map[(m1,m2)][metric] = np.mean(model_pairs_map[(m1,m2)][metric])
-    for key in model_pairs_map:
-        print(key)
-        print("   ", model_pairs_map[key])
+    ##consolidate map
+    consolidated = {key: {x_label: [] for x_label in x_labels} for key in unreduced_map} ##key: perm, value: {x_label: list of values}
+    for perm in unreduced_map: 
+        for dataset in unreduced_map[perm]:
+            for key in unreduced_map[perm][dataset]:
+                consolidated[perm][key] = consolidated[perm][key] + unreduced_map[perm][dataset][key]
+
+    ##get baseline and add it to consolidated 
+    unreduced_baseline = pickle.load(open("pickles/unreduced_baseline_default_mode=1.pkl", "rb"))
+    for base_method in ["scGPT", "gears", "mean_perturbed", "smart_mean_perturbed"]:
+        b_m = {x_label: [] for x_label in x_labels} ##key: x_label, value: list of scores across datasets
+        ##consolidate across datasets for baseline, and organize to match consolidated
+        for dataset in unreduced_baseline[base_method]:
+            for x_label in unreduced_baseline[base_method][dataset]:
+                if dataset in ["adam_corrected_upr", "norman", "replogle_k562_essential"]: ##only include the 3 core datasets in this calculation for statistical significance (for main results)
+                    if base_method in ["scGPT", "gears"]:
+                        b_m[x_label] = b_m[x_label] + unreduced_baseline[base_method][dataset][x_label]
+                    else: ##mean baselines are differently formatted ({mean method: {dataset: {metric: score,... } }) because there is no stochasticity / idea of an independently trained model, 
+                        b_m[x_label] = b_m[x_label] + [unreduced_baseline[base_method][dataset][x_label]] * 10 ##need to account for the 10 comparisons that were made (even if same result)
+        ##add baseline results to consolidated
+        consolidated[base_method] = b_m
+    # print(consolidated)
+    pairs = list(itertools.combinations(list(consolidated.keys()), 2))
+    for p1, p2 in pairs:
+        for x_label in x_labels: 
+            t_statistic, p_value = scipy.stats.ttest_ind(consolidated[p1][x_label], consolidated[p2][x_label], alternative='two-sided')
+            if p_value < 0.05:
+                significance_char = "**"
+            else:
+                significance_char = ""
+            print(f"{p1} | {p2}: {x_label}: sample_sizes: {len(consolidated[p1][x_label])}, {len(consolidated[p2][x_label])}, mean_difference: {abs(np.mean(consolidated[p1][x_label]) - np.mean(consolidated[p2][x_label]))}, p_val: {significance_char}{p_value}{significance_char}")
 
 def plot_model_losses():
     paths = [] 
@@ -549,6 +558,26 @@ def plot_cell_and_pert_counts():
     plt.title("Perturbation Overlap Between Datasets")
     plt.savefig(f"outputs/venn_diagram_pert_overlap.png", dpi=300)
 
+def plot_gene_counts():
+    gene_len_dict = {}
+    for data_name in datasets:
+        pert_data = get_pert_data(data_name)        
+        gene_len_dict[data_name] = len(set(pert_data.adata.var["gene_name"].tolist()))
+    fig, ax = plt.subplots()
+    x_labels = datasets
+    x = np.array(range(0, len(x_labels)))
+    plt_x_labels = [get_dataset_title(x) for x in x_labels]
+    ax.set_xticks(x)
+    ax.set_xticklabels(plt_x_labels)
+    ax.set_xlabel("Dataset")
+    y = [gene_len_dict[x_label] for x_label in x_labels]
+    ax.bar(x, y)
+    for i,j in zip(x, y):
+        ax.annotate(f"{j}", xy=(i - 0.11, j + 120),fontsize=10)
+    plt.title("Number of Genes in Dataset")
+    plt.ylim((0, max(y) + 500))
+    plt.savefig("outputs/gene_sizes.png", dpi=300)
+
 def print_cell_types():
     for data_name in datasets:
         pert_data = PertData("./data")
@@ -621,15 +650,14 @@ def get_weight_similarity():
         plt.ylim((-1.1, 1.1))
         plt.savefig(f"outputs/weight_sim_{model_2}_{model_1}.png", dpi=300)
 
-def find_best_models(mode=1):
+def find_best_models(root_dirs, mode=1):
     """
     Returns a map from model to path with highest score
+    Searched root_dirs
     will also print a mapping from directory to best model contained within that directory by dataset
     """
     ##find all paths to result files within save, check if part of a multi-run 
     model_types = ["scgpt", "simple_affine", "gears", "linear_additive", "latent_additive", "decoder_only"]
-    # root_dirs = ["save/default_config_baseline/", "save/simple_affine/", "save/perturbench/", "pickles/gears_results/"]
-    root_dirs = ["save/no_pretraining/", "save/default_config_baseline/", "save/simple_affine/", "save/simple_affine_with_pretraining/", "save/perturbench/", "pickles/gears_results/"]
     directory_to_best = {root: {dataset: ("", 0) for dataset in datasets} for root in root_dirs}
     paths = [] 
     for root_dir in root_dirs:
@@ -682,16 +710,7 @@ def plot_wasserstein_pert_gene_comparison():
     dataset_to_w = {data_name: () for data_name in datasets} ##key: dataset, value: (w1 mean, w1 std, w1 len, w2 mean, w2 std, w2 len)
     ##iterate over each dataset and compute wassersteins from test set 
     for data_name in datasets: 
-       
         pert_data = get_pert_data(data_name)
-        # pert_data = PertData("./data")
-        # pert_data.load(data_name=data_name)
-        # pert_data.prepare_split(split="simulation", seed=1)
-        # pert_data.get_dataloader(batch_size=64, test_batch_size=64)
-        # if "replogle" in data_name:
-        #     modify_pertdata_anndata(pert_data)
-
-        
         adata = pert_data.adata
         wasserstein_1_list, wasserstein_2_list = [], []
         for query in set(adata.obs["condition"]): 
@@ -734,6 +753,9 @@ def plot_wasserstein_pert_gene_comparison():
     for data_name in datasets: 
         ##make into boxplots
         y = [dataset_to_w[data_name][0], dataset_to_w[data_name][1]]
+        ##significance test
+        t_statistic, p_value = scipy.stats.ttest_ind(dataset_to_w[data_name][0], dataset_to_w[data_name][1], alternative='two-sided')
+        print(f"Wasserstein statistical tests: {data_name}: t_statistic: {t_statistic}, p_value: {p_value}")
         bp_targets = ax.boxplot(y, positions=np.array(range(0, len(y)))*2.0 + spacer, sym='', widths=widths)
         spacer = spacer + 0.4
         set_box_color(bp_targets, color_map[data_name], plt)
@@ -816,7 +838,8 @@ def find_best_run_number(string, model_type):
 
 def plot_rank_scores(mode=1, include_perturbench=False):
     fig, ax = plt.subplots()
-    best_models = find_best_models(mode=mode)
+    root_dirs = [ "save/default_config_baseline/", "save/perturbench/", "pickles/gears_results/"]
+    best_models = find_best_models(root_dirs, mode=mode)
     model_types = ["gears", "mean_perturbed", "smart_mean_perturbed", "scgpt", "linear_additive", "latent_additive", "decoder_only"]
     proper_x_labels = {"gears": "GEARS", "scgpt": "scGPT", "mean_perturbed": "Mean", "smart_mean_perturbed": "CRISPR-informed\nMean", "linear_additive": "Linear Additive", "latent_additive": "Latent Additive", "decoder_only": "Decoder Only"}
     width = 0.15
@@ -950,11 +973,12 @@ def compare_number_model_params():
     x_labels = ["Simple Affine", "scGPT"]
     ax.set_xticklabels(x_labels)
     y = [simple_affine_params, scgpt_params]
+    y = [float(y_ / 1000000.0) for y_ in y]
     ax.bar(x, y, width=width, color=["grey", "#519E3E"])
     for i,j in zip(x, y):
         ax.annotate(f"{j:.2E}", xy=(i - .06, j + 800000),fontsize=7)
     plt.title(f"Trainable Parameters Comparsion")
-    ax.set_ylabel("Number of Parameters")
+    ax.set_ylabel("Number of Parameters (in Millions)")
     box = ax.get_position()
     ax.set_position([box.x0, box.y0, box.width, box.height * 0.85])
     plt.gcf().subplots_adjust(top=.76)
@@ -1034,7 +1058,7 @@ def plot_perturbench_comparison(mode):
 def make_metric_violinplots(dir = '', output_prefix='violinplot', exclude_target_gene=False, exclude_combos=False):
     """
     function written by Abby for supplemental figure
-    dir = relative path to dataset files
+    dir = relative path to dataset file results
     output_prefix = beginning of path to save the output plot
     exclude_target_gene = whether to exclude the gene that was perturbed and the condition where the gene was targeted
     exclude_combos = whether to exclude combination perturbations
@@ -1077,7 +1101,6 @@ def make_metric_violinplots(dir = '', output_prefix='violinplot', exclude_target
         # gene-level violin plot
         gene_plot_data = all_gene_level_metrics_df[['Pearson_correlation_simple_affine_simple_affine','Pearson_correlation_simple_affine_simple_affine_with_pretraining', 'Pearson_correlation_scGPT_no_pretraining', 'Pearson_correlation_scGPT_default_config_baseline']]
         num_genes = gene_plot_data.shape[0]
-        print(num_genes)
         if num_genes < 500:
             sns.swarmplot(data=gene_plot_data, ax=ax[0])
         else:
@@ -1326,24 +1349,245 @@ def get_perturbation_level_metrics(preds_df, actual_df, control_means_df, pertur
     }, index=perturbation_labels)
     return results_df
 
+def plot_condition_specific_performance():
+    """
+    Plot performance of different perturbation conditions
+    plot will be specific dataset pearson delta / pearson de delta
+    x-axis: conditions 
+    y-axis: scores
+    """
+    if not os.path.isdir("outputs/breakdown/"):
+        os.makedirs("outputs/breakdown/")
+    ##load condition map 
+    metrics = ["pearson_delta", "pearson_de_delta"]
+    places = ["Top 20", "Bottom 20"]
+    models = {"gears": "GEARS", "scGPT": "scGPT Fully Fine-Tuned Baseline", "smart_mean_perturbed": "CRISPR-informed Mean"}
+    color_map = {"gears": "#3B75AF", "smart_mean_perturbed": "goldenrod", "scGPT": "#519E3E"}
+    metric_label_map = {"pearson": "Pearson", "pearson_de": "Pearson DE", "pearson_delta": "Pearson Delta", "pearson_de_delta": "Pearson DE Delta"}
+    model_map = {model: {dataset: "" for dataset in datasets} for model in models}
+    root_dirs = ["save/default_config_baseline/", "pickles/gears_results/"]
+    best_models = find_best_models(root_dirs, mode=1)
+    for dataset in datasets: 
+        for model in models: 
+            if model == "gears":
+                best_gears_model = best_models["gears"][dataset][0]
+                model_run_id = find_best_run_number(best_gears_model, "gears")
+                # model_run_id = re.findall(r"[0-9]+.pkl", best_gears_model)[0].split(".")[0]
+                model_map[model][dataset] = pickle.load(open(f"pickles/gears_results/gears_condition_specific_results_{dataset}_{model_run_id}.pkl", "rb"))
+            else: ##scGPT eval done with front-running already
+                model_map[model][dataset] = pickle.load(open(f"save/test_condition_specific_performance/{model}_condition_specific_results_{dataset}.pkl", "rb"))
+    ##select 20 conditions at random per study and keep consistent for all models 
+    # dataset_to_conditions = {dataset: [] for dataset in datasets}
+    # for dataset in model_map["scGPT"]:
+    #     ##select 20 conditions at random and sort 
+    #     n = 20
+    #     plot_conditions = sorted(random.sample(list(model_map["scGPT"][dataset].keys()), n))
+    #     dataset_to_conditions[dataset] = plot_conditions
 
-# shutil.rmtree("outputs/")       
-# os.mkdir("outputs/")  
+    ##select CRISPR mean's top 20 and bottom 20 conditions per metric per study and keep consistent for all models 
+    dataset_to_conditions = {place: {metric: {dataset: [] for dataset in datasets} for metric in metrics} for place in places}
+    for dataset in model_map["smart_mean_perturbed"]:
+        for metric in metrics: 
+            n = 20
+            items = sorted(model_map["smart_mean_perturbed"][dataset].items(), key=lambda x:x[1][metric])
+            top_n = items[-1 * n:]
+            bottom_n = items[0:n]
+            dataset_to_conditions["Top 20"][metric][dataset] = [x[0] for x in top_n]
+            dataset_to_conditions["Bottom 20"][metric][dataset] = [x[0] for x in bottom_n]
+    ##make plots
+    width = 0.15
+    for metric in metrics:
+        for dataset in datasets:
+            for place in places: 
+                fig, ax = plt.subplots()
+                # x_labels = dataset_to_conditions[dataset]
+                x_labels = dataset_to_conditions[place][metric][dataset]
+                plt_x_labels = list(x_labels)
+                x = np.array(range(0, len(x_labels)))
+                ax.set_xticks(x)
+                mean_superior_indices = []
+                ##indices of x_labels where mean is the best, append them with a ** in plot
+                for i in range(0, len(x_labels)):
+                    x_label = x_labels[i]
+                    if model_map["smart_mean_perturbed"][dataset][x_label][metric] > model_map["scGPT"][dataset][x_label][metric] \
+                        and model_map["smart_mean_perturbed"][dataset][x_label][metric] > model_map["gears"][dataset][x_label][metric]:
+                        mean_superior_indices.append(i)
+                for m_s_i in mean_superior_indices:
+                    plt_x_labels[m_s_i] = "** " + x_labels[m_s_i]
+                ax.set_xticklabels(plt_x_labels, fontsize=7)
+                plt.yticks(fontsize=7)  
+                plt.xticks(rotation=90)
+                ax.set_ylabel(metric_label_map[metric], fontsize=7)
+                min_y = 1.0
+                for model in models: 
+                    y = [model_map[model][dataset][x_label][metric] for x_label in x_labels]
+                    ax.bar(x, y, width=width, label=models[model], color=color_map[model])
+                    x = x + width
+                    min_y = min(min_y, min(y))
+                plt.ylim((min_y - 0.1, 1.01))
+                plt.title(f"Performance of CRISPR-informed Mean's {place}\nPerturbation Conditions for {get_dataset_title(dataset)}", fontsize=9)
+                box = ax.get_position()
+                ax.set_position([box.x0, box.y0, box.width, box.height * 0.85])
+                ax.legend(loc='upper right', prop={"size":7}, bbox_to_anchor=(1, 1.38))
+                plt.gcf().subplots_adjust(top=.78, bottom=.25)
+                plt.savefig(f"outputs/breakdown/{place}_{dataset}_{metric}.png", dpi=300,  bbox_inches='tight')
 
-# plot_rank_scores(mode=1, include_perturbench=True)
-# plot_simple_affine_run_times()
-# compare_number_model_params()
-# get_avg_baseline(mode=1)
-# plot_subset_model_scores(mode=1)
-# plot_perturbench_comparison(mode=1)
-# plot_model_scores(mode=1)
-# make_metric_violinplots(dir="/hpfs/projects/mlcs/mlhub/perturbseq/scGPT_baseline_results/", output_prefix="outputs/", exclude_target_gene=False, exclude_combos=True)
-# make_metric_violinplots(dir="/hpfs/projects/mlcs/mlhub/perturbseq/scGPT_baseline_results/", output_prefix="outputs/", exclude_target_gene=False, exclude_combos=False)
+def get_genes_sorted_by_std(dataset):
+    pert_data = get_pert_data(dataset)
+    std_map = {}
+    X = pert_data.adata.X.toarray()
+    gene_list = pert_data.adata.var["gene_name"].tolist()
+    for i in range(0, len(gene_list)):
+        gene = gene_list[i]
+        std_map[gene] = np.std(X[:,i])
+    sorted_map = sorted(std_map.items(), key=lambda x: x[1])
+    return sorted_map
 
-# plot_cell_and_pert_counts()
-# plot_avg_pearson_to_avg_perturbed_state()
-# plot_wasserstein_pert_gene_comparison()
+def plot_gene_specific_performance():
+    """
+    plot pearson of top 20 performing genes for scGPT, fully fine-tuned and GEARS, and CRISPR-informed mean
+    """
+    if not os.path.isdir("outputs/gene_breakdown/"):
+        os.makedirs("outputs/gene_breakdown/")
+    models = {"gears": "GEARS", "scGPT": "scGPT Fully Fine-Tuned Baseline", "smart_mean_perturbed": "CRISPR-informed Mean"}
+    color_map = {"gears": "#3B75AF", "smart_mean_perturbed": "goldenrod", "scGPT": "#519E3E"}
+    metric_label_map = {"pearson": "Pearson", "pearson_de": "Pearson DE", "pearson_delta": "Pearson Delta", "pearson_de_delta": "Pearson DE Delta"}
+    places = ["Top 20", "Bottom 20"]
+    model_map = {model: {dataset: {place: [] for place in places} for dataset in datasets} for model in models}
+    root_dirs = ["save/default_config_baseline/", "pickles/gears_results/"]
+    best_models = find_best_models(root_dirs, mode=1)
+    for dataset in datasets: 
+        for model in models: 
+            if model == "gears":
+                best_gears_model = best_models["gears"][dataset][0]
+                model_run_id = find_best_run_number(best_gears_model, "gears")
+                results = pickle.load(open(f"pickles/gears_results/gears_gene_specific_results_{dataset}_{model_run_id}.pkl", "rb"))
+            else: ##scGPT eval done with front-running already
+                results = pickle.load(open(f"save/test_condition_specific_performance/{model}_gene_specific_results_{dataset}.pkl", "rb"))
+            ##filter out NaN pearsons 
+            results = {key: results[key] for key in results if not np.isnan(results[key])}
+            ##filter results to top 20 genes and bottom 20 genes
+            sorted_results = sorted(results.items(), key=lambda x: x[1])
+            model_map[model][dataset]["Bottom 20"] = sorted_results[0:20]
+            model_map[model][dataset]["Top 20"] = sorted_results[-20:]
+    
+    for dataset in datasets:
+        scgpt_set = set([x[0] for x in model_map["scGPT"][dataset]["Top 20"]])
+        mean_set = set([x[0] for x in model_map["smart_mean_perturbed"][dataset]["Top 20"]])
+        gears_set = set([x[0] for x in model_map["gears"][dataset]["Top 20"]])
+        print("overlap between top 20 scGPT and top 20 mean model: ")
+        print("    ", dataset, len(scgpt_set.intersection(mean_set)))
+        print("overlap between top 20 GEARS and top 20 mean model: ")
+        print("    ", dataset, len(gears_set.intersection(mean_set)))
+        # sorted_genes_by_std = [x[0] for x in get_genes_sorted_by_std(dataset)]
+        # for gene in scgpt_set: 
+        #     print(f" {sorted_genes_by_std.index(gene)} / {len(sorted_genes_by_std)}")
+    
+    width = 0.15
+    for dataset in datasets:
+        for model in models:
+            for place in places:
+                fig, ax = plt.subplots()
+                x_labels = [item[0] for item in model_map[model][dataset][place]]
+                x = np.array(range(0, len(x_labels)))
+                ax.set_xticks(x)
+                ax.set_xticklabels(x_labels)
+                plt.xticks(rotation=90)
+                y =  [item[1] for item in model_map[model][dataset][place]]
+                ax.bar(x, y, width=width, label=models[model], color=color_map[model])
+                ax.set_ylabel("Pearson Score")
+                plt.ylim((min(y) - 0.1, 1.0))
+                suffix = "Highest" if place == "Top 20" else "Lowest"
+                plt.title(f"{place} {suffix} Performing Genes\nfor {models[model]} on {get_dataset_title(dataset)}", fontsize=11)
+                # plt.gcf().subplots_adjust(bottom=.25)
+                plt.gcf().subplots_adjust(top=.60, bottom=.40)
+                plt.savefig(f"outputs/gene_breakdown/{model}_{dataset}_{place}.png", dpi=300, bbox_inches='tight')
+
+def plot_cross_validation():
+    x_label_map = {"pearson": "Pearson", "pearson_de": "Pearson DE", "pearson_delta": "Pearson Delta", "pearson_de_delta": "Pearson DE Delta"}
+    x_labels = list(x_label_map.keys())
+    models = {"gears": "GEARS", "baseline_mean_perturbed": "Mean", "smart_mean_perturbed": "CRISPR-informed Mean", "scGPT": "scGPT Fully Fine-Tuned Baseline", "linear_additive": "Linear Additive", "latent_additive": "Latent Additive", "decoder_only": "Decoder Only"}
+    color_map = {"gears": "#3B75AF", "baseline_mean_perturbed": "salmon", "smart_mean_perturbed": "goldenrod", "scGPT": "#519E3E", "linear_additive": "dimgray", "latent_additive": "darkgrey", "decoder_only": "lightgrey"}
+    paths = [] 
+    model_results = {model: {dataset: "" for dataset in datasets} for model in models}
+    ##get scGPT, mean, CRISPR-informed mean, and perturbench model cross val results
+    for root, dirs, files in os.walk("save/cross_val/"):
+        for file in files:
+            if "_pert_delta_results" in file:
+                paths.append(os.path.join(root, file))
+    for dataset in datasets:
+        for model in ["scGPT", "baseline_mean_perturbed", "smart_mean_perturbed"]:
+            y_model, y_model_std = get_path_results(f"save/cross_val/scgpt_{dataset}_run_1/{model}_pert_delta_results_{dataset}.pkl", paths, x_label_map.keys(), mode=1)
+            model_results[model][dataset] = y_model, y_model_std
+        for model in ["linear_additive", "latent_additive", "decoder_only"]:
+            y_model, y_model_std = get_path_results(f"save/cross_val/perturbench_{dataset}_run_1/{model}_pert_delta_results_{dataset}.pkl", paths, x_label_map.keys(), mode=1)
+            model_results[model][dataset] = y_model, y_model_std
+    ##get gears mean cross val results
+    for root, dirs, files in os.walk("pickles/gears_results_cv/"):
+        for file in files:
+            if "_pert_delta_results" in file:
+                paths.append(os.path.join(root, file))
+    gears_map = {dataset: {x_label: [] for x_label in x_label_map} for dataset in datasets}
+    for dataset in datasets: 
+        for run_number in [1,2,3,4]:
+            gears_res = pickle.load(open(f"pickles/gears_results_cv/gears_pert_delta_results_{dataset}_cross_val_{run_number}.pkl", "rb"))
+            print(dataset, gears_res)
+            for x_label in x_label_map:
+                gears_map[dataset][x_label].append(gears_res[x_label])
+    gears_map = {dataset: {x_label: (np.mean(gears_map[dataset][x_label]), np.std(gears_map[dataset][x_label])) for x_label in x_labels} for dataset in gears_map} 
+    gears_map = {dataset: ([gears_map[dataset][x_label][0] for x_label in x_labels], [gears_map[dataset][x_label][1] for x_label in x_labels]) for dataset in gears_map}
+    model_results["gears"] = gears_map
+    ##now make plots
+    width = 0.12
+    for dataset in datasets:
+        fig, ax = plt.subplots()
+        x = np.array(range(0, len(x_labels)))
+        plt_x_labels = [x_label_map[x] for x in x_label_map]
+        ax.set_xticks(x)
+        ax.set_xticklabels(plt_x_labels, fontsize=8.5)
+        plt.xticks(rotation=15)
+        for model in model_results:
+            y = model_results[model][dataset][0]
+            y_std = model_results[model][dataset][1]
+            ax.bar(x, y, yerr=y_std, width=width, label=models[model], color=color_map[model], error_kw={"elinewidth":0.5, "capsize":0.5})
+            for i,j in zip(x, y):
+                ax.annotate(f"{round(j, 2)}", xy=(i - .06, j +.02),fontsize=4.5)
+            x = x + width 
+        plt.title(f"Cross-Validation Results for {get_dataset_title(dataset)}", fontsize=10)
+        ax.set_ylabel("Pearson Score")
+        box = ax.get_position()
+        ax.set_position([box.x0, box.y0, box.width, box.height * 0.85])
+        ax.legend(loc='upper right', prop={"size":6}, bbox_to_anchor=(1, 1.37))
+        plt.gcf().subplots_adjust(top=.76)
+        plt.savefig(f"outputs/cross_val_{dataset}.png", dpi=300)
+   
 
 
-# plot_model_losses()
-# find_best_models(mode=1)
+shutil.rmtree("outputs/")       
+os.mkdir("outputs/")  
+
+#short run-times
+get_avg_baseline(mode=1)
+plot_perturbench_comparison(mode=1)
+plot_subset_model_scores(mode=1)
+##plot_subset_model_scores(mode=1, include_simple_affine=True) ##for checking statistical significance, actual plot is too crowded
+plot_rank_scores(mode=1, include_perturbench=True)
+plot_model_scores(mode=1)
+plot_simple_affine_run_times()
+compare_number_model_params()
+plot_cross_validation() 
+plot_cell_and_pert_counts()
+plot_gene_counts()
+plot_condition_specific_performance()
+plot_gene_specific_performance()
+make_metric_violinplots(dir="/hpfs/projects/mlcs/mlhub/perturbseq/scGPT_baseline_results/", output_prefix="outputs/", exclude_target_gene=False, exclude_combos=True)
+make_metric_violinplots(dir="/hpfs/projects/mlcs/mlhub/perturbseq/scGPT_baseline_results/", output_prefix="outputs/", exclude_target_gene=False, exclude_combos=False)
+
+##longer run-time
+plot_avg_pearson_to_avg_perturbed_state()
+plot_wasserstein_pert_gene_comparison()
+
+#not for manuscript figure generation
+plot_model_losses()
+root_dirs = ["save/no_pretraining/", "save/default_config_baseline/", "save/simple_affine/", "save/simple_affine_with_pretraining/", "save/perturbench/", "pickles/gears_results/"]
+find_best_models(mode=1)

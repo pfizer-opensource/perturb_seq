@@ -22,10 +22,13 @@ def main():
     parser.add_argument("--use_lora", type=bool_flag, default=False, help="True if we want to use LoRa for finetuning")
     parser.add_argument("--lora_rank", type=int, default=8, help="if use_lora, specifies the inner dimension of the low-rank matrices to train")
     parser.add_argument("--config_path", type=str, default="config/default_config.json", help="path to JSON configuration file to use for setting up model")
-    parser.add_argument("--model_type", type=str, default="scGPT", help="scGPT, simple_affine, mean_control, mean_perturbed, mean_control+perturbed, smart_mean_control, smart_mean_perturbed, smart_mean_control+perturbed")
+    parser.add_argument("--model_type", type=str, default="scGPT", help="scGPT, simple_affine, simple_affine_large, mean_control, mean_perturbed, mean_control+perturbed, smart_mean_control, smart_mean_perturbed, smart_mean_control+perturbed")
     parser.add_argument("--validation_selection", type=str, default="pearson", help="how to select the best model during training, if 'pearson' will be by pearson correlation between predicted and actual expression over validation set, if 'loss' will be by minimal loss")
     parser.add_argument("--loss_type", type=str, default="mse", help="mse, mse+triplet, mse+pearson")
     parser.add_argument("--fixed_seed", type=bool_flag, default=True, help="True if we want to use a constant fixed seed")
+    parser.add_argument("--cross_validation", type=bool_flag, default=False, help="if True will cross validate instead of single random split, --cross_validation_fold arg must also be set")
+    parser.add_argument("--cross_validation_fold", type=int, default=None, help="which fold to train")
+
     opt = parser.parse_args()
     check_args(opt)
     matplotlib.rcParams["savefig.transparent"] = False
@@ -70,7 +73,10 @@ def main():
         logger.info("WARNING: filtering dataloaders! but keeping pert_data.adata the same")
         modify_pertdata_dataloaders(pert_data, logger)
 
-    check_pert_split(opt.data_name, pert_data)
+    if opt.cross_validation:
+        cross_validate_split(pert_data, opt.cross_validation_fold)
+    else:
+        check_pert_split(opt.data_name, pert_data)
 
     logger.info(f"adata.obs: {pert_data.adata.obs}")
     logger.info(f"|conditions|: {len(set(pert_data.adata.obs['condition']))}")
@@ -103,7 +109,7 @@ def main():
     ##mean predictor models - compute after data loaders are set (after a possible application of filter_perturbations)
     if opt.mode in ["train", "test", "analysis"]:
         for baseline in ["smart", "baseline"]:
-            for mean_type in ["perturbed", "control", "control+perturbed"]:
+            for mean_type in ["perturbed"]:#, "control", "control+perturbed"]:
                 ##baseline mean 
                 if baseline == "baseline":
                     mean_pred_model = MeanPredictor(pert_data, opt.data_name, mean_type=mean_type)
@@ -115,7 +121,8 @@ def main():
                 ##get rank metrics 
                 test_perts = pickle.load(open(f"pickles/{opt.data_name}_perturbation_splits.pkl", "rb"))["test"]   
                 ranks = get_rank(mean_pred_model, test_perts, pert_data=pert_data, var=var, gene_ids=gene_ids, gene_idx_map=gene_idx_map)
-                pickle.dump(ranks, open(rank_save, "wb"))
+                if opt.cross_validation == False: ##save ranks to global pickles/ only on main split 
+                    pickle.dump(ranks, open(rank_save, "wb"))
                 ##GEARS-type metrics
                 mean_res = eval_perturb(pert_data.dataloader["test_loader"], mean_pred_model, gene_ids=[], gene_idx_map={}, var={"device":"cpu"}, loss_type=opt.loss_type) ##keep on cpu, no need to shuttle to gpu for mean pred model 
                 mean_metrics, mean_metrics_pert  = compute_metrics(mean_res) ##from GEARS library
@@ -125,6 +132,12 @@ def main():
                 mean_metrics = compute_perturbation_metrics(mean_res, pert_data.adata[pert_data.adata.obs["condition"] == "ctrl"]) ##from scGPT library
                 logger.info(f"{opt.data_name} {baseline} mean {mean_type} delta test metrics: {mean_metrics}")
                 pickle.dump(mean_metrics, open(save_dir / f"{baseline}_mean_{mean_type}_pert_delta_results_{opt.data_name}.pkl", "wb"))
+                ##condition specific performance 
+                condition_map = get_condition_performance_breakdown(mean_res, pert_data.adata[pert_data.adata.obs["condition"] == "ctrl"]) 
+                pickle.dump(condition_map, open(save_dir / f"{baseline}_mean_{mean_type}_condition_specific_results_{opt.data_name}.pkl", "wb"))
+                ##gene specific performance 
+                gene_to_pearson_map = get_gene_performance_breakdown(mean_res, pert_data.adata[pert_data.adata.obs["condition"] == "ctrl"]) 
+                pickle.dump(gene_to_pearson_map, open(save_dir / f"{baseline}_mean_{mean_type}_gene_specific_results_{opt.data_name}.pkl", "wb"))
     
     if opt.model_type == "scGPT": 
         model = TransformerGenerator(
@@ -142,9 +155,10 @@ def main():
             pert_pad_id=var["pert_pad_id"],
             use_fast_transformer=var["use_fast_transformer"],
         )
-    
-    elif opt.model_type == "simple_affine":
+    elif "simple_affine" in opt.model_type:
         from simple_affine import SimpleAffine 
+        is_large = True if "large" in opt.model_type else False
+        print("LARGE: ", is_large)
         model = SimpleAffine(
             ntoken=ntokens,
             d_model=var["embsize"],
@@ -154,6 +168,7 @@ def main():
             dropout=var["dropout"],
             pad_token=var["pad_token"],
             pert_pad_id=var["pert_pad_id"],
+            is_large=is_large
         )
     elif "mean" in opt.model_type:
         if "smart" in opt.model_type:
@@ -165,7 +180,7 @@ def main():
     else:
         raise Exception("model_type must be one of scGPT, simple_affine, mean_control, mean_perturbed, mean_control+perturbed, smart_mean_control, smart_mean_perturbed, smart_mean_control+perturbed")
 
-    if opt.model_type in ["scGPT", "simple_affine"]:
+    if opt.model_type in ["scGPT", "simple_affine", "simple_affine_large"]:
         model = load_model(var, model, model_file, logger, attention_control=opt.attention_control, freeze_input_encoder=opt.freeze_input_encoder, freeze_transformer_encoder=opt.freeze_transformer_encoder, mode=opt.mode, use_lora=opt.use_lora, lora_rank=opt.lora_rank, pretrain_control=opt.pretrain_control, transformer_encoder_control=opt.transformer_encoder_control, input_encoder_control=opt.input_encoder_control)
         model.to(var["device"])
 
@@ -244,6 +259,11 @@ def main():
         test_metrics = compute_perturbation_metrics(test_res, pert_data.adata[pert_data.adata.obs["condition"] == "ctrl"]) ##from scGPT utils library
         logger.info(f"{opt.data_name} delta test metrics: {test_metrics}")
         pickle.dump(test_metrics, open(save_dir / f"{opt.model_type}_pert_delta_results_{opt.data_name}.pkl", "wb"))
+        ##condition specific performance 
+        condition_map = get_condition_performance_breakdown(test_res, pert_data.adata[pert_data.adata.obs["condition"] == "ctrl"]) 
+        pickle.dump(condition_map, open(save_dir / f"{opt.model_type}_condition_specific_results_{opt.data_name}.pkl", "wb"))
+        gene_to_pearson_map = get_gene_performance_breakdown(test_res, pert_data.adata[pert_data.adata.obs["condition"] == "ctrl"]) 
+        pickle.dump(gene_to_pearson_map, open(save_dir / f"{opt.model_type}_gene_specific_results_{opt.data_name}.pkl", "wb"))
 
     if opt.mode == "analysis":    
         for plot_type in ["boxplots", "scatterplots"]:

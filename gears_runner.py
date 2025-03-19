@@ -5,9 +5,9 @@ from gears.inference import evaluate
 import pickle
 from scgpt.utils import compute_perturbation_metrics
 
-def run_gears(runs=1, mode="train"):
+def run_gears(runs=1, mode="train", cross_validation=False):
     for run_number in range(0, runs):
-        for data_name in ["adam_corrected", "adam_corrected_upr", "adamson", "norman", "replogle_k562_essential"]:
+        for data_name in ["adam_corrected_upr", "norman", "replogle_k562_essential", "adam_corrected", "adamson"]:
             ##setup PertData object
             if data_name == "adam_corrected":
                 pert_data = get_adam_corrected_dataset(split="simulation", batch_size=64, test_batch_size=64, generate_new=False, just_upr=False)
@@ -26,28 +26,42 @@ def run_gears(runs=1, mode="train"):
                 pert_data.get_dataloader(batch_size = 64, test_batch_size = 64)
             if "replogle" in data_name:
                 modify_pertdata_dataloaders(pert_data, logger=None)
+            if cross_validation:
+                cross_validate_split(pert_data, run_number + 1)
+                prefix = "pickles/gears_results_cv/"
+                suffix = f"cross_val_{run_number + 1}"
+            else:
+                prefix = "pickles/gears_results/"
+                suffix = f"{run_number}"
             gears_model = GEARS(pert_data, device = 'cuda:0')
             if mode == "train":
                 # set up and train a model
                 gears_model.model_initialize(hidden_size = 64)
                 gears_model.train(epochs = 20) #20 originally
-                gears_model.save_model(f'gears_models/gears_trained_{data_name}_{run_number}')
+                print("finished training, save model")
+                gears_model.save_model(f'gears_models/gears_trained_{data_name}_{suffix}')
             #load model
-            gears_model.load_pretrained(f'gears_models/gears_trained_{data_name}_{run_number}')
+            gears_model.load_pretrained(f'gears_models/gears_trained_{data_name}_{suffix}')
             ##evaluate
             eval_results = evaluate(loader=pert_data.dataloader['test_loader'], model=gears_model.model, uncertainty=gears_model.config['uncertainty'], device=torch.device("cuda:0"))
             ##get rank score
             ranks = get_gears_rank(eval_results)
             print("avg rank: ", np.mean(list(ranks.values())), np.std(list(ranks.values())))
-            pickle.dump(ranks, open(f"pickles/gears_results/gears_rank_metrics_{data_name}_{run_number}.pkl", "wb"))
+            pickle.dump(ranks, open(f"{prefix}gears_rank_metrics_{data_name}_{suffix}.pkl", "wb"))
             ##get pearson scores
             metrics, metrics_pert = compute_metrics(eval_results)
             test_metrics = compute_perturbation_metrics(eval_results, pert_data.adata[pert_data.adata.obs["condition"] == "ctrl"])
             print(f"metrics: {metrics}")
             print(f"metrics_pert: {metrics_pert}")
             print(f"test metrics: {test_metrics}")
-            pickle.dump((metrics, metrics_pert), open(f"pickles/gears_results/gears_results_{data_name}_{run_number}.pkl", "wb"))
-            pickle.dump(test_metrics, open(f"pickles/gears_results/gears_pert_delta_results_{data_name}_{run_number}.pkl", "wb"))
+            pickle.dump((metrics, metrics_pert), open(f"{prefix}gears_results_{data_name}_{suffix}.pkl", "wb"))
+            pickle.dump(test_metrics, open(f"{prefix}gears_pert_delta_results_{data_name}_{suffix}.pkl", "wb"))
+            ##condition specific performance 
+            condition_map = get_condition_performance_breakdown(eval_results, pert_data.adata[pert_data.adata.obs["condition"] == "ctrl"]) 
+            pickle.dump(condition_map, open(f"{prefix}gears_condition_specific_results_{data_name}_{suffix}.pkl", "wb"))
+            ##gene specific performance 
+            gene_to_pearson_map = get_gene_performance_breakdown(eval_results, pert_data.adata[pert_data.adata.obs["condition"] == "ctrl"]) 
+            pickle.dump(gene_to_pearson_map, open(f"{prefix}gears_gene_specific_results_{data_name}_{suffix}.pkl", "wb"))
 
 def get_gears_rank(eval_results):
     pert_map = {} ##key: condition, value: (actual avg truth vector, predicted avg vector)
@@ -62,6 +76,13 @@ def get_gears_rank(eval_results):
     return ranks
 
 print("running gears")
+##no cross validation 
 ##mode = "train" for training or "eval" for just evaluating models
-run_gears(runs=10, mode="train")
+run_gears(runs=10, mode="train", cross_validation=False)
+run_gears(runs=10, mode="eval", cross_validation=False)
+
+##using cross validation 
+##if cross_validate, then the fold will be the run_number + 1
+run_gears(runs=4, mode="train", cross_validation=True)
+
 

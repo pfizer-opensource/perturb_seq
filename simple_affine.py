@@ -3,6 +3,8 @@ from scgpt.model.generation_model import *
 class SimpleAffine(nn.Module):
     """
     Equivalent model architecture to scGPT minus the transformer blocks
+    If large: will replace scGPT's transformer block with a stack of (default=12) feed forward layers
+    else will just drop the transformer block
     """
     def __init__(
         self,
@@ -17,6 +19,7 @@ class SimpleAffine(nn.Module):
         decoder_activation: Optional[str] = None,
         decoder_adaptive_bias: bool = False,
         explicit_zero_prob: bool = False,
+        is_large: bool = False 
     ):
         super().__init__()
         self.model_type = "SimpleAffine"
@@ -33,6 +36,9 @@ class SimpleAffine(nn.Module):
             activation=decoder_activation,
             adaptive_bias=decoder_adaptive_bias,
         )
+        self.is_large = is_large
+        if self.is_large:
+            self.MLP = MLP(512, [512] * nlayers, 512, activation=nn.ReLU)
 
     def _encode(
         self,
@@ -76,7 +82,11 @@ class SimpleAffine(nn.Module):
             src, processed_values, input_pert_flags, src_key_padding_mask
         )
         output = {}
-        mlm_output = self.decoder(encoder_output, values)
+        if self.is_large: ##run encoded input through MLP, then decoder
+            hidden = self.MLP(encoder_output)
+            mlm_output = self.decoder(hidden, values)
+        else:
+            mlm_output = self.decoder(encoder_output, values)
         output["mlm_output"] = mlm_output["pred"]  # (batch, seq_len)
         return output
 
@@ -125,3 +135,21 @@ class SimpleAffine(nn.Module):
         pred_gene_values = torch.zeros_like(ori_gene_values)
         pred_gene_values[:, input_gene_ids] = output_values
         return pred_gene_values
+
+class MLP(nn.Module):
+    def __init__(self, input_size, hidden_sizes, output_size, activation=nn.ReLU):
+        super().__init__()
+        layers = []
+        # Input layer
+        layers.append(nn.Linear(input_size, hidden_sizes[0]))
+        layers.append(activation())
+        # Hidden layers
+        for i in range(0, len(hidden_sizes) - 1):
+            layers.append(nn.Linear(hidden_sizes[i], hidden_sizes[i+1]))
+            layers.append(activation())
+        # Output layer
+        layers.append(nn.Linear(hidden_sizes[-1], output_size))
+        self.layers = nn.Sequential(*layers)
+        print("LLL", layers)
+    def forward(self, x):
+        return self.layers(x)
