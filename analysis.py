@@ -353,6 +353,7 @@ def plot_subset_model_scores(mode, include_simple_affine=False):
             if key in path: 
                 assigned_key = key
                 break
+        
         if dataset in ["adam_corrected_upr", "norman", "replogle_k562_essential"]: ##only include the 3 core datasets in this calculation for statistical significance (for main results)
             if unreduced_map[assigned_key][dataset] == "": 
                 unreduced_map[assigned_key][dataset] = unreduced
@@ -437,6 +438,8 @@ def get_p_val_comparisons(unreduced_map, x_labels):
             else:
                 significance_char = ""
             print(f"{p1} | {p2}: {x_label}: sample_sizes: {len(consolidated[p1][x_label])}, {len(consolidated[p2][x_label])}, mean_difference: {abs(np.mean(consolidated[p1][x_label]) - np.mean(consolidated[p2][x_label]))}, p_val: {significance_char}{p_value}{significance_char}")
+            # print(f"    {np.mean(consolidated[p1][x_label])} | {np.mean(consolidated[p2][x_label])}")
+            # print(f"    {consolidated[p1][x_label]} | {consolidated[p2][x_label]}")
 
 def plot_model_losses():
     paths = [] 
@@ -1351,6 +1354,10 @@ def get_perturbation_level_metrics(preds_df, actual_df, control_means_df, pertur
 
 def plot_condition_specific_performance():
     """
+    Two plots:
+    1) scatterplot where each point is a target with x = mean model pearson delta, y = scGPT pearson delta
+
+    2)
     Plot performance of different perturbation conditions
     plot will be specific dataset pearson delta / pearson de delta
     x-axis: conditions 
@@ -1376,14 +1383,49 @@ def plot_condition_specific_performance():
                 model_map[model][dataset] = pickle.load(open(f"pickles/gears_results/gears_condition_specific_results_{dataset}_{model_run_id}.pkl", "rb"))
             else: ##scGPT eval done with front-running already
                 model_map[model][dataset] = pickle.load(open(f"save/test_condition_specific_performance/{model}_condition_specific_results_{dataset}.pkl", "rb"))
-    ##select 20 conditions at random per study and keep consistent for all models 
-    # dataset_to_conditions = {dataset: [] for dataset in datasets}
-    # for dataset in model_map["scGPT"]:
-    #     ##select 20 conditions at random and sort 
-    #     n = 20
-    #     plot_conditions = sorted(random.sample(list(model_map["scGPT"][dataset].keys()), n))
-    #     dataset_to_conditions[dataset] = plot_conditions
 
+    ##scatterplot where each point is a target with x = mean model pearson delta, y = scGPT pearson delta
+    for dataset in datasets:
+        for metric in ["pearson_delta"]:
+            for model in ["scGPT", "gears"]:
+                fig, ax = plt.subplots()
+                x1, y1 = [], [] ##when mean model is better
+                x2, y2 = [], [] ##when deep model is better
+                x3, y3 = [], [] ##when equal
+                # targets = []
+                for target in model_map["smart_mean_perturbed"][dataset]:
+                    deep_score = model_map[model][dataset][target][metric]
+                    mean_score = model_map["smart_mean_perturbed"][dataset][target][metric]
+                    if mean_score > deep_score:
+                        x1.append(deep_score)
+                        y1.append(mean_score)
+                    elif deep_score > mean_score:
+                        x2.append(deep_score)
+                        y2.append(mean_score)
+                        # targets.append(target)
+                    else:
+                        x3.append(deep_score)
+                        y3.append(mean_score)
+                print(dataset, targets)
+                ax.scatter(x1, y1, color=color_map["smart_mean_perturbed"])
+                ax.scatter(x2, y2, color=color_map[model])
+                ax.scatter(x3, y3, color="grey")
+                ##label the targets where deep did better
+                # print(targets)
+                # for i, label in enumerate(targets):
+                #     if label in ["RPS5+ctrl", "RPL35A+ctrl"]: ##manually move some of these because they overlap too much and can't see them
+                #         plt.annotate(label, (x2[i], y2[i] + 0.03), fontsize=4)
+                #     else:
+                #         plt.annotate(label, (x2[i], y2[i]), fontsize=4)
+                ax.set_xlabel(models[model])
+                ax.set_ylabel("CRISPR-informed Mean")
+                ax.plot([-.3, 1], [-.3, 1], '--', alpha=0.75, color="black", zorder=0) ##plot x = y line 
+                plt.xlim((-.3, 1.03))
+                plt.ylim((-.3, 1.03))
+                plt.title(f"{models[model]} vs CRISPR-informed Mean{metric_label_map[metric]}\nby Target for {get_dataset_title(dataset)}")
+                plt.savefig(f"outputs/breakdown/scatter_{dataset}_{model}_{metric}.png", dpi=300)
+
+    ##bar graphs of top 20 and bottom 20
     ##select CRISPR mean's top 20 and bottom 20 conditions per metric per study and keep consistent for all models 
     dataset_to_conditions = {place: {metric: {dataset: [] for dataset in datasets} for metric in metrics} for place in places}
     for dataset in model_map["smart_mean_perturbed"]:
@@ -1425,7 +1467,10 @@ def plot_condition_specific_performance():
                     x = x + width
                     min_y = min(min_y, min(y))
                 plt.ylim((min_y - 0.1, 1.01))
-                plt.title(f"Performance of CRISPR-informed Mean's {place}\nPerturbation Conditions for {get_dataset_title(dataset)}", fontsize=9)
+                if dataset == "adam_corrected_upr": ##this dataset just has 20 test set perturbations
+                    plt.title(f"Performance of All Test Set Conditions for {get_dataset_title(dataset)}", fontsize=9)
+                else:
+                    plt.title(f"Performance of CRISPR-informed Mean's {place}\nPerturbation Conditions for {get_dataset_title(dataset)}", fontsize=9)
                 box = ax.get_position()
                 ax.set_position([box.x0, box.y0, box.width, box.height * 0.85])
                 ax.legend(loc='upper right', prop={"size":7}, bbox_to_anchor=(1, 1.38))
@@ -1570,7 +1615,6 @@ os.mkdir("outputs/")
 get_avg_baseline(mode=1)
 plot_perturbench_comparison(mode=1)
 plot_subset_model_scores(mode=1)
-##plot_subset_model_scores(mode=1, include_simple_affine=True) ##for checking statistical significance, actual plot is too crowded
 plot_rank_scores(mode=1, include_perturbench=True)
 plot_model_scores(mode=1)
 plot_simple_affine_run_times()
@@ -1588,6 +1632,7 @@ plot_avg_pearson_to_avg_perturbed_state()
 plot_wasserstein_pert_gene_comparison()
 
 #not for manuscript figure generation
-plot_model_losses()
-root_dirs = ["save/no_pretraining/", "save/default_config_baseline/", "save/simple_affine/", "save/simple_affine_with_pretraining/", "save/perturbench/", "pickles/gears_results/"]
-find_best_models(mode=1)
+# plot_subset_model_scores(mode=1, include_simple_affine=True) ##for checking statistical significance, actual plot is too crowded
+# plot_model_losses()
+# root_dirs = ["save/no_pretraining/", "save/default_config_baseline/", "save/simple_affine/", "save/simple_affine_with_pretraining/", "save/perturbench/", "pickles/gears_results/"]
+# find_best_models(mode=1)
